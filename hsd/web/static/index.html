@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HSD Dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="header">
+    <div class="flex items-center gap-4">
+      <h1>HSD</h1>
+      <div class="flex gap-2">
+        <button class="btn icon" onclick="switchView('board')" title="Board (g b)">Board</button>
+        <button class="btn icon" onclick="switchView('needs-you')" title="Needs You (g n)">Needs You</button>
+        <button class="btn icon" onclick="switchView('activity')" title="Activity (g a)">Activity</button>
+        <button class="btn icon" onclick="switchView('stats')" title="Stats (g s)">Stats</button>
+        <button class="btn icon" onclick="switchView('lint')">Lint</button>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span class="text-sm text-secondary">Ctrl+K</span>
+      <button id="theme-toggle" class="btn icon">☾</button>
+    </div>
+  </header>
+  <div class="main">
+    <div class="sidebar" id="sidebar"></div>
+    <div class="view-panel" id="main"></div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
