@@ -105,7 +105,7 @@ def create_app(db: Database | None = None) -> FastAPI:
         _notify_clients(app)
         return _task_detail(result)
 
-    @app.post("/api/tasks/{slug}/export")
+    @app.get("/api/tasks/{slug}/export")
     async def export_task(slug: str, fmt: str = "md"):
         task = db.get_task(slug)
         if task is None:

@@ -257,7 +257,7 @@ def review(db: Database, slug_or_id: str,
     # No self-review
     ok, warn = validate_no_self_review(task, reviewer_harness, reviewer_model)
     if not ok:
-        click.echo(f"Error: {err}", err=True)
+        click.echo(f"Error: {warn}", err=True)
         sys.exit(1)
     if warn:
         click.echo(f"Warning: {warn}")

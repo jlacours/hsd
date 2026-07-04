@@ -4,6 +4,7 @@ Runs on stdio transport. Each MCP-aware harness connects via its own process.
 """
 
 import json
+import re
 import os
 import sys
 
@@ -26,21 +27,22 @@ from hsd.render.org import render_task as render_org
 INSTRUCTIONS = """# HSD Protocol v2
 
 This MCP server manages a shared task board backed by SQLite. Tasks represent
-coding handoffs that flow through stages: todo → in-progress → done → reviewed
+coding handoffs that flow through stages: todo -> in-progress -> done -> reviewed
 (with possible human revision).
 
 ## Lifecycle
-1. **create_task** — any harness can queue a task (todo/queued).
-2. **claim_task** — a harness atomically claims it (in-progress).
-3. **update_task** — owner updates sections/status while working.
-4. **submit_for_review** — gates on required sections, moves to done.
-5. **record_review** — no self-review; routes to reviewed/todo/human-revision.
-6. **escalate_to_human** — any stage → to-be-revised-by-human.
-7. **resolve_human_action** — to-be-revised-by-human → todo.
+1. **create_task** -- any harness can queue a task (todo/queued).
+2. **claim_task** -- a harness atomically claims it (in-progress).
+3. **update_task** -- owner updates sections/status while working.
+4. **submit_for_review** -- gates on required sections, moves to done.
+5. **record_review** -- no self-review; routes to reviewed/todo/human-revision.
+6. **escalate_to_human** -- any stage -> to-be-revised-by-human.
+7. **resolve_human_action** -- to-be-revised-by-human -> todo.
 
 ## Rules
 - Claim is atomic: exactly one harness wins.
 - No self-review: reviewer harness must differ from owner harness.
+- Owner-only: update_task and submit_for_review require caller identity.
 - Submit requires: summary_for_review, work_completed, commands_verification, next_actions.
 - Secret scan rejects PEM keys, API keys (ghp_, sk-*), AWS keys, JWTs.
 - All timestamps are server-stamped UTC.
@@ -78,12 +80,12 @@ def _get_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "slug": {"type": "string", "description": "URL-safe unique identifier (kebab-case)"},
+                    "slug": {"type": "string", "description": "URL-safe unique identifier (kebab-case, e.g. 'my-task-name')"},
                     "title": {"type": "string", "description": "Human-readable title"},
                     "destination": {"type": "string", "description": "Target harness or 'any'"},
                     "sections": {
                         "type": "object",
-                        "description": "Section name → markdown content",
+                        "description": "Section name -> markdown content",
                         "additionalProperties": {"type": "string"},
                     },
                     "source_harness": {"type": "string", "description": "Your harness name"},
@@ -100,7 +102,7 @@ def _get_tools() -> list[Tool]:
         ),
         Tool(
             name="claim_task",
-            description="Atomically claim a task (todo → in-progress). Fails if already claimed.",
+            description="Atomically claim a task (todo -> in-progress). Fails if already claimed.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -113,40 +115,44 @@ def _get_tools() -> list[Tool]:
         ),
         Tool(
             name="update_task",
-            description="Update sections or status of a task you own.",
+            description="Update sections or status of a task you own. Requires harness+model to verify ownership.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "slug_or_id": {"type": "string"},
+                    "harness": {"type": "string", "description": "Your harness name (must match owner)"},
+                    "model": {"type": "string", "description": "Your model identifier"},
                     "section_patches": {
                         "type": "object",
-                        "description": "Section name → new content",
+                        "description": "Section name -> new content",
                         "additionalProperties": {"type": "string"},
                     },
                     "status": {"type": "string", "enum": ["queued", "in-progress", "blocked", "complete"]},
                 },
-                "required": ["slug_or_id"],
+                "required": ["slug_or_id", "harness"],
             },
         ),
         Tool(
             name="submit_for_review",
-            description="Submit your task for review (in-progress → done). Requires: summary_for_review, work_completed, commands_verification, next_actions.",
+            description="Submit your task for review (in-progress -> done). Requires caller harness+model for ownership check and: summary_for_review, work_completed, commands_verification, next_actions.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "slug_or_id": {"type": "string"},
+                    "harness": {"type": "string", "description": "Your harness name (must match owner)"},
+                    "model": {"type": "string", "description": "Your model identifier"},
                     "sections": {
                         "type": "object",
                         "description": "Required sections for the review gate",
                         "additionalProperties": {"type": "string"},
                     },
                 },
-                "required": ["slug_or_id", "sections"],
+                "required": ["slug_or_id", "harness", "sections"],
             },
         ),
         Tool(
             name="record_review",
-            description="Record a review verdict. Rejects self-review (same harness). Routes by verdict: accepted → reviewed, changes-requested → todo, human-revision-required → to-be-revised-by-human.",
+            description="Record a review verdict. Rejects self-review (same harness). Routes by verdict: accepted -> reviewed, changes-requested -> todo, human-revision-required -> to-be-revised-by-human.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -162,7 +168,7 @@ def _get_tools() -> list[Tool]:
         ),
         Tool(
             name="escalate_to_human",
-            description="Escalate a task to human revision (any stage → to-be-revised-by-human).",
+            description="Escalate a task to human revision (any stage -> to-be-revised-by-human).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -219,21 +225,18 @@ def make_server(db: Database | None = None) -> Server:
         return _get_tools()
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict) -> CallToolResult:
         try:
             return await _handle_call(db, name, arguments)
         except Exception as e:
-            return [TextContent(
-                type="text",
-                text=json.dumps({"error": str(e)}, indent=2),
-            )]
+            return error_result(f"Server error: {e}")
 
     return server
 
 
 async def _handle_call(
     db: Database, name: str, args: dict
-) -> list[TextContent]:
+) -> CallToolResult:
     match name:
         case "list_board":
             tasks = db.list_tasks(
@@ -256,33 +259,39 @@ async def _handle_call(
                     "staleness_hours": round(t.staleness_hours, 1),
                     "updated_at": t.updated_at,
                 })
-            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            return ok_result(result)
 
         case "get_task":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(task), indent=2))]
+                return error_result(f"Task not found: {args['slug_or_id']}")
+            return ok_result(_task_to_dict(task))
 
         case "create_task":
+            # Validate slug is kebab-case
+            slug = args["slug"]
+            if not re.match(r'^[a-z][a-z0-9-]*$', slug):
+                return error_result(
+                    f"Invalid slug: {slug!r}. Slug must be kebab-case "
+                    f"(lowercase letters, digits, hyphens only)."
+                )
             # Validate model note
             ok, err = validate_model_note(
                 args.get("source_model", ""),
                 args.get("model_check_note"),
             )
             if not ok:
-                return _error(err)
+                return error_result(err)
 
             # Validate no secrets in sections
             sections = args.get("sections", {})
             for key, content in sections.items():
                 ok, err = validate_no_secrets(content)
                 if not ok:
-                    return _error(f"Secret in section '{key}': {err}")
+                    return error_result(f"Secret in section '{key}': {err}")
 
-            # Validate transition legality (Nones → todo)
             task = db.create_task(
-                slug=args["slug"],
+                slug=slug,
                 title=args["title"],
                 destination=args.get("destination", "any"),
                 sections=sections,
@@ -295,7 +304,7 @@ async def _handle_call(
                 branch_commit=args.get("branch_commit"),
                 tree_state=args.get("tree_state"),
             )
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(task), indent=2))]
+            return ok_result(_task_to_dict(task))
 
         case "claim_task":
             result = db.claim_task(
@@ -304,71 +313,95 @@ async def _handle_call(
                 args["model"],
             )
             if result is None:
-                return _error("Task already claimed or not in todo stage")
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+                return error_result("Task already claimed or not in todo stage")
+            return ok_result(_task_to_dict(result))
 
         case "update_task":
+            # Owner check
+            task = db.get_task(args["slug_or_id"])
+            if task is None:
+                return error_result(f"Task not found: {args['slug_or_id']}")
+            harness = args["harness"]
+            if task.owner_harness and harness.lower() != task.owner_harness.lower():
+                return error_result(
+                    f"update_task denied: harness '{harness}' does not match "
+                    f"owner '{task.owner_harness}'"
+                )
+            if task.stage != "in-progress":
+                return error_result(
+                    f"update_task denied: task is in '{task.stage}', "
+                    f"only 'in-progress' tasks can be updated"
+                )
+
             section_patches = args.get("section_patches")
             if section_patches:
                 for key, content in section_patches.items():
                     ok, err = validate_no_secrets(content)
                     if not ok:
-                        return _error(f"Secret in section '{key}': {err}")
+                        return error_result(f"Secret in section '{key}': {err}")
             result = db.update_task(
                 args["slug_or_id"],
                 section_patches=section_patches,
                 status=args.get("status"),
             )
             if result is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+                return error_result(f"Task not found: {args['slug_or_id']}")
+            return ok_result(_task_to_dict(result))
 
         case "submit_for_review":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
+                return error_result(f"Task not found: {args['slug_or_id']}")
+
+            # Owner check
+            harness = args.get("harness")
+            if task.owner_harness and harness.lower() != task.owner_harness.lower():
+                return error_result(
+                    f"submit_for_review denied: harness '{harness}' does not match "
+                    f"owner '{task.owner_harness}'"
+                )
 
             # Validate transition
             ok, reason = validate_transition(task, "done")
             if not ok:
-                return _error(reason)
+                return error_result(reason)
 
             # Patch sections first
             sections = args.get("sections", {})
             for key, content in sections.items():
                 ok, err = validate_no_secrets(content)
                 if not ok:
-                    return _error(f"Secret in section '{key}': {err}")
+                    return error_result(f"Secret in section '{key}': {err}")
 
             if sections:
                 task = db.update_task(task.slug, section_patches=sections)
                 if task is None:
-                    return _error("Task not found after update")
+                    return error_result("Task not found after update")
 
             # Check submit gate
             ok, reason = validate_submit_gate(task)
             if not ok:
-                return _error(f"Submit gate: {reason}")
+                return error_result(f"Submit gate: {reason}")
 
             result = db.transition_task(
                 task.slug, "done",
-                actor_harness=task.owner_harness or "unknown",
-                actor_model=task.owner_model or "unknown",
+                actor_harness=harness or task.owner_harness or "unknown",
+                actor_model=args.get("model") or task.owner_model or "unknown",
                 note="submitted for review",
             )
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+            return ok_result(_task_to_dict(result))
 
         case "record_review":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
+                return error_result(f"Task not found: {args['slug_or_id']}")
 
             # No self-review
             ok, warn = validate_no_self_review(
                 task, args["reviewer_harness"], args["reviewer_model"],
             )
             if not ok:
-                return _error(warn)
+                return error_result(warn)
 
             result, error = db.add_review(
                 args["slug_or_id"],
@@ -379,13 +412,13 @@ async def _handle_call(
                 args["disposition"],
             )
             if error:
-                return _error(error)
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+                return error_result(error)
+            return ok_result(_task_to_dict(result))
 
         case "escalate_to_human":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
+                return error_result(f"Task not found: {args['slug_or_id']}")
 
             result = db.transition_task(
                 task.slug, "to-be-revised-by-human",
@@ -393,24 +426,24 @@ async def _handle_call(
                 actor_model=task.owner_model or "unknown",
                 note=f"Escalated: {args.get('reason', '')}. Human action: {args.get('exact_human_action', '')}",
             )
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+            return ok_result(_task_to_dict(result))
 
         case "resolve_human_action":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
+                return error_result(f"Task not found: {args['slug_or_id']}")
             result = db.transition_task(
                 task.slug, "todo",
                 actor_harness="human",
                 actor_model="human",
                 note=args.get("note", "Resolved by human"),
             )
-            return [TextContent(type="text", text=json.dumps(_task_to_dict(result), indent=2))]
+            return ok_result(_task_to_dict(result))
 
         case "export_handoff":
             task = db.get_task(args["slug_or_id"])
             if task is None:
-                return _error(f"Task not found: {args['slug_or_id']}")
+                return error_result(f"Task not found: {args['slug_or_id']}")
             fmt = args.get("format", "md")
             if fmt == "md":
                 content = render_md(task)
@@ -420,15 +453,15 @@ async def _handle_call(
             if path:
                 with open(path, "w") as f:
                     f.write(content)
-                return [TextContent(type="text", text=json.dumps({"exported_to": path}))]
-            return [TextContent(type="text", text=content)]
+                return ok_result({"exported_to": path})
+            return ok_result(content)
 
         case "board_stats":
             stats = db.board_stats()
-            return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+            return ok_result(stats)
 
         case _:
-            return _error(f"Unknown tool: {name}")
+            return error_result(f"Unknown tool: {name}")
 
 
 def _task_to_dict(task: "Task") -> dict:
@@ -479,12 +512,18 @@ def _task_to_dict(task: "Task") -> dict:
     }
 
 
-def _error(msg: str) -> list[TextContent]:
-    return [TextContent(
-        type="text",
-        text=json.dumps({"error": msg}, indent=2),
+def ok_result(data) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(data, indent=2))],
+        isError=False,
+    )
+
+
+def error_result(msg: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps({"error": msg}, indent=2))],
         isError=True,
-    )]
+    )
 
 
 def main() -> None:

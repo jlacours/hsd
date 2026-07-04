@@ -125,6 +125,16 @@ class Migrator:
             branch_commit = metadata.get("branch/commit")
             tree_state = metadata.get("working tree")
 
+            # Infer owner from board directory for non-todo stages
+            owner_harness = None
+            owner_model = None
+            if stage_name != "todo" and harness_name != "any-harness":
+                owner_harness = metadata.get("owner harness", harness_name)
+                owner_model = metadata.get("owner model")
+
+            # Create timestamp from filename for both timestamps
+            file_ts = self._extract_timestamp(md_path)
+
             # Store original path as artifact
             artifacts = sections.get("artifacts", "")
             if artifacts:
@@ -154,18 +164,20 @@ class Migrator:
                 repository=repository_meta,
                 branch_commit=branch_commit,
                 tree_state=tree_state,
+                stage=stage_name,
+                updated_at=file_ts,
             )
 
-            # Override the stage to match the file's board location
-            self.db.transition_task(
-                slug, stage_name,
-                actor_harness="migration",
-                actor_model="hsd-migrate",
-                note=f"imported from v1 board at {md_path}",
-            )
+            # Set owner directly via update if inferred
+            if owner_harness:
+                self.db._conn().execute(
+                    "UPDATE tasks SET owner_harness = ?, owner_model = ? WHERE slug = ?",
+                    (owner_harness, owner_model, slug),
+                )
+                self.db._conn().commit()
 
             result.imported += 1
-            logger.info(f"Imported: {slug} from {md_path}")
+            logger.info(f"Imported: {slug} from {md_path} (stage={stage_name}, owner={owner_harness})")
 
         except Exception as e:
             result.errors += 1
