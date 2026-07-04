@@ -43,6 +43,7 @@ TIMESTAMP_FILENAME_RE = re.compile(
 class MigrationResult:
     imported: int = 0
     skipped: int = 0
+    healed: int = 0
     errors: int = 0
     error_details: list[str] = field(default_factory=list)
 
@@ -81,6 +82,95 @@ class Migrator:
                     self._import_file(md_file, harness_name, stage_name, result)
 
         return result
+
+    def heal(self, source_dir: str | None = None) -> MigrationResult:
+        """Backfill owner and updated_at for already-imported tasks.
+
+        Walks the v1 board and updates existing DB rows that have NULL
+        owner_harness or stale updated_at. Safe to re-run; idempotent.
+        """
+        if source_dir is None:
+            source_dir = os.path.expanduser("~/.harnesses_share_directory")
+
+        source = Path(source_dir)
+        if not source.is_dir():
+            return MigrationResult(errors=1, error_details=[f"Source directory not found: {source}"])
+
+        result = MigrationResult()
+
+        for harness_dir in HARNESS_DIRS:
+            hdir = source / harness_dir
+            if not hdir.is_dir():
+                continue
+            harness_name = harness_dir.replace("for-", "", 1)
+
+            for stage_name, stage_subdir in STAGE_DIRS.items():
+                sdir = hdir / stage_subdir
+                if not sdir.is_dir():
+                    continue
+
+                for md_file in sorted(sdir.glob("*.md")):
+                    self._heal_file(md_file, harness_name, stage_name, result)
+
+        return result
+
+    def _heal_file(
+        self,
+        md_path: Path,
+        harness_name: str,
+        stage_name: str,
+        result: MigrationResult,
+    ) -> None:
+        """Update owner and updated_at for one already-imported task."""
+        try:
+            slug = self._extract_slug(md_path)
+            if slug is None:
+                return  # silent skip — not our file
+
+            existing = self.db.get_task(slug)
+            if existing is None:
+                return  # not imported yet, heal is a no-op
+
+            file_ts = self._extract_timestamp(md_path)
+            updates: list[str] = []
+            params: list = []
+
+            # Update timestamp if it differs (i.e. was set at import time, not from filename)
+            if existing.updated_at != file_ts:
+                updates.append("updated_at = ?")
+                params.append(file_ts)
+
+            # Set owner if NULL and inferrable from board directory
+            owner_harness = None
+            owner_model = None
+            if stage_name != "todo" and harness_name != "any-harness":
+                owner_harness = harness_name
+            if owner_harness and existing.owner_harness is None:
+                # Read the file to extract owner model from metadata
+                content = md_path.read_text(encoding="utf-8")
+                metadata = self._parse_metadata(content)
+                owner_model = metadata.get("owner model")
+                updates.append("owner_harness = ?")
+                params.append(owner_harness)
+                updates.append("owner_model = ?")
+                params.append(owner_model)
+
+            if not updates:
+                return  # nothing to heal
+
+            params.append(slug)
+            sql = f"UPDATE tasks SET {', '.join(updates)} WHERE slug = ?"
+            self.db._conn().execute(sql, params)
+            self.db._conn().commit()
+            result.healed += 1
+            logger.info(
+                f"Healed: {slug} — updated {', '.join(u.split(' =')[0] for u in updates)}"
+            )
+
+        except Exception as e:
+            result.errors += 1
+            result.error_details.append(f"{md_path}: {e}")
+            logger.exception(f"Error healing {md_path}")
 
     def _import_file(
         self,

@@ -348,19 +348,30 @@ def stats(db: Database) -> None:
 
 @cli.command()
 @click.option("--source", default=None, help="V1 share directory path (default: ~/.harnesses_share_directory)")
+@click.option("--heal", is_flag=True, help="Backfill owner and timestamps for already-imported tasks")
 @PASS_DB
-def migrate(db: Database, source: str | None) -> None:
+def migrate(db: Database, source: str | None, heal: bool) -> None:
     """Migrate tasks from the v1 file-pair board into the database."""
     migrator = Migrator(db)
-    result = migrator.migrate(source)
-    click.echo(f"Migration complete:")
-    click.echo(f"  Imported: {result.imported}")
-    click.echo(f"  Skipped (already exist): {result.skipped}")
-    click.echo(f"  Errors: {result.errors}")
-    if result.error_details:
-        click.echo("  Error details:")
-        for err in result.error_details:
-            click.echo(f"    - {err}")
+    if heal:
+        result = migrator.heal(source)
+        click.echo(f"Heal complete:")
+        click.echo(f"  Healed: {result.healed}")
+        click.echo(f"  Errors: {result.errors}")
+        if result.error_details:
+            click.echo("  Error details:")
+            for err in result.error_details:
+                click.echo(f"    - {err}")
+    else:
+        result = migrator.migrate(source)
+        click.echo(f"Migration complete:")
+        click.echo(f"  Imported: {result.imported}")
+        click.echo(f"  Skipped (already exist): {result.skipped}")
+        click.echo(f"  Errors: {result.errors}")
+        if result.error_details:
+            click.echo("  Error details:")
+            for err in result.error_details:
+                click.echo(f"    - {err}")
 
 
 @cli.command()

@@ -157,3 +157,59 @@ class TestMigration:
         task = db.get_task("completed-task")
         assert task is not None
         assert task.updated_at == "2026-07-03T10:00:00Z"
+
+    def test_heal_backfills_owner(self, db: Database, v1_board: Path):
+        """heal sets owner_harness for tasks imported without it."""
+        # Import fresh (owner is now set during import, so simulate old import)
+        migrator = Migrator(db)
+        migrator.migrate(str(v1_board))
+
+        # Wipe owner to simulate pre-fix state
+        db._conn().execute("UPDATE tasks SET owner_harness = NULL, owner_model = NULL WHERE slug = 'completed-task'")
+        db._conn().commit()
+
+        result = migrator.heal(str(v1_board))
+        assert result.healed >= 1
+        assert result.errors == 0
+
+        task = db.get_task("completed-task")
+        assert task.owner_harness == "codex"
+
+    def test_heal_backfills_timestamp(self, db: Database, v1_board: Path):
+        """heal sets updated_at from filename when it differs."""
+        migrator = Migrator(db)
+        migrator.migrate(str(v1_board))
+
+        # Wipe timestamp to simulate pre-fix state
+        db._conn().execute(
+            "UPDATE tasks SET updated_at = '2024-01-01T00:00:00Z' WHERE slug = 'completed-task'"
+        )
+        db._conn().commit()
+
+        result = migrator.heal(str(v1_board))
+        assert result.healed >= 1
+
+        task = db.get_task("completed-task")
+        assert task.updated_at == "2026-07-03T10:00:00Z"
+
+    def test_heal_idempotent(self, db: Database, v1_board: Path):
+        """heal can be re-run safely."""
+        migrator = Migrator(db)
+        migrator.migrate(str(v1_board))
+
+        # Wipe owner to simulate pre-fix state
+        db._conn().execute("UPDATE tasks SET owner_harness = NULL, owner_model = NULL WHERE slug = 'completed-task'")
+        db._conn().commit()
+
+        r1 = migrator.heal(str(v1_board))
+        assert r1.healed >= 1
+
+        r2 = migrator.heal(str(v1_board))
+        assert r2.healed == 0  # already healed
+
+    def test_heal_skips_nonexistent(self, db: Database, v1_board: Path):
+        """heal silently skips files not in the DB."""
+        migrator = Migrator(db)
+        result = migrator.heal(str(v1_board))  # no import first
+        assert result.healed == 0
+        assert result.errors == 0
