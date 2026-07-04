@@ -84,14 +84,14 @@ class Task:
 
 # Transition matrix: maps (from_stage, to_stage) -> allowed
 # None as from_stage means "any"
-ALLOWED_TRANSITIONS: dict[tuple[str | None, str], str] = {
-    (None, "todo"): "create",
+ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("todo", "in-progress"): "claim",
     ("in-progress", "done"): "submit",
     ("done", "reviewed"): "approve",
     ("done", "todo"): "changes-requested",
     ("done", "to-be-revised-by-human"): "human-revision-required",
-    (None, "to-be-revised-by-human"): "escalate",
+    ("in-progress", "to-be-revised-by-human"): "escalate",
+    ("todo", "to-be-revised-by-human"): "escalate",
     ("to-be-revised-by-human", "todo"): "human-resolve",
 }
 

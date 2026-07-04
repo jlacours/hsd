@@ -16,12 +16,7 @@ def validate_transition(
 
     Returns (allowed, reason_if_denied).
     """
-    # Check direct (from, to)
     if (task.stage, to_stage) in ALLOWED_TRANSITIONS:
-        return True, ""
-
-    # Check generic (None, to) — allows from any stage
-    if (None, to_stage) in ALLOWED_TRANSITIONS:
         return True, ""
 
     return False, (
@@ -98,6 +93,6 @@ def _allowed_from(stage: str) -> list[str]:
     """List stages that can be transitioned to from the given stage."""
     result = []
     for (from_stage, to_stage), reason in ALLOWED_TRANSITIONS.items():
-        if from_stage is None or from_stage == stage:
+        if from_stage == stage:
             result.append(f"{stage} → {to_stage} ({reason})")
     return result

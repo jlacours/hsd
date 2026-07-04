@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from hsd.core.models import Task, Section, Transition, Review
+from hsd.core.rules import validate_transition
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -151,8 +152,18 @@ class Database:
         repository: str | None = None,
         branch_commit: str | None = None,
         tree_state: str | None = None,
+        stage: str = "todo",
+        updated_at: str | None = None,
     ) -> Task:
-        now = _utcnow()
+        now = updated_at or _utcnow()
+        status_map = {
+            "todo": "queued",
+            "in-progress": "in-progress",
+            "done": "complete",
+            "reviewed": "complete",
+            "to-be-revised-by-human": "blocked",
+        }
+        status = status_map.get(stage, "queued")
         conn = self._conn()
         with _immediate(conn):
             conn.execute(
@@ -160,9 +171,9 @@ class Database:
                    (slug, title, destination, stage, status, source_harness,
                     source_model, model_check_note, author, working_dir,
                     repository, branch_commit, tree_state, created_at, updated_at)
-                   VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    slug, title, destination,
+                    slug, title, destination, stage, status,
                     source_harness, source_model, model_check_note,
                     author, working_dir, repository, branch_commit, tree_state,
                     now, now,
@@ -178,8 +189,8 @@ class Database:
             conn.execute(
                 """INSERT INTO transitions (task_id, at, actor_harness, actor_model,
                    from_stage, to_stage, note)
-                   VALUES (?, ?, ?, ?, NULL, 'todo', 'task created')""",
-                (task_id, now, source_harness, source_model),
+                   VALUES (?, ?, ?, ?, NULL, ?, 'task created')""",
+                (task_id, now, source_harness, source_model, stage),
             )
         return self.get_task(task_id)
 
@@ -299,11 +310,19 @@ class Database:
         actor_model: str,
         note: str | None = None,
     ) -> Task | None:
-        """Move a task to a new stage and record the transition."""
-        now = _utcnow()
+        """Move a task to a new stage and record the transition.
+
+        Validates the transition against the transition matrix via
+        validate_transition. Raises ValueError for illegal moves.
+        Returns None if the task is not found.
+        """
         task = self.get_task(slug_or_id)
         if task is None:
             return None
+        ok, reason = validate_transition(task, to_stage)
+        if not ok:
+            raise ValueError(reason)
+        now = _utcnow()
         conn = self._conn()
         with _immediate(conn):
             status_map = {
@@ -335,12 +354,20 @@ class Database:
         findings: str,
         disposition: str,
     ) -> tuple[Task | None, str | None]:
-        """Record a review and route the task. Returns (task, error)."""
+        """Record a review and route the task. Returns (task, error).
+
+        Only tasks in 'done' stage may be reviewed.
+        On 'changes-requested', owner fields are cleared and destination is set
+        to the previous owner so the task can be re-claimed.
+        """
         task = self.get_task(slug_or_id)
         if task is None:
             return None, "task not found"
-        if task.stage not in ("done", "reviewed", "to-be-revised-by-human"):
-            return None, f"task is in '{task.stage}', not awaiting review"
+        if task.stage != "done":
+            return None, (
+                f"task is in '{task.stage}'; only tasks in 'done' stage "
+                f"can be reviewed"
+            )
 
         if reviewer_harness.lower() == (task.owner_harness or "").lower():
             return None, "self-review rejected: reviewer harness matches owner harness"
@@ -359,10 +386,30 @@ class Database:
                 "changes-requested": "todo",
                 "human-revision-required": "to-be-revised-by-human",
             }[verdict]
-            conn.execute(
-                "UPDATE tasks SET stage = ?, updated_at = ? WHERE id = ?",
-                (to_stage, now, task.id),
-            )
+
+            if verdict == "changes-requested":
+                # NULL owner so task can be re-claimed; set destination to
+                # previous owner so it routes back to the right harness
+                prev_owner = task.owner_harness or "any"
+                conn.execute(
+                    """UPDATE tasks SET stage = ?, destination = ?,
+                       owner_harness = NULL, owner_model = NULL,
+                       updated_at = ? WHERE id = ?""",
+                    (to_stage, prev_owner, now, task.id),
+                )
+            elif verdict == "human-revision-required":
+                # Clear owner so human-resolve must be followed by re-claim
+                conn.execute(
+                    """UPDATE tasks SET stage = ?, owner_harness = NULL,
+                       owner_model = NULL, updated_at = ? WHERE id = ?""",
+                    (to_stage, now, task.id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET stage = ?, updated_at = ? WHERE id = ?",
+                    (to_stage, now, task.id),
+                )
+
             review_note = f"review verdict: {verdict}"
             conn.execute(
                 """INSERT INTO transitions (task_id, at, actor_harness, actor_model,
