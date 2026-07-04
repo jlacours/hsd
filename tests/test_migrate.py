@@ -139,3 +139,21 @@ class TestMigration:
         assert task is not None
         # The task should be in 'done' stage (matching the directory it was in)
         assert task.stage == "done"
+
+    def test_migrate_infers_owner(self, db: Database, v1_board: Path):
+        """Non-todo tasks get owner inferred from board directory name."""
+        migrator = Migrator(db)
+        migrator.migrate(str(v1_board))
+
+        task = db.get_task("completed-task")
+        assert task is not None
+        assert task.owner_harness == "codex"
+
+    def test_migrate_preserves_timestamp(self, db: Database, v1_board: Path):
+        """updated_at is set from the filename timestamp."""
+        migrator = Migrator(db)
+        migrator.migrate(str(v1_board))
+
+        task = db.get_task("completed-task")
+        assert task is not None
+        assert task.updated_at == "2026-07-03T10:00:00Z"

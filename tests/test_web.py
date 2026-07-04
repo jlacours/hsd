@@ -95,7 +95,7 @@ class TestWebAPI:
             sections={"objective": "export test"},
             source_harness="h", source_model="m",
         )
-        resp = await client.post("/api/tasks/export-me/export?fmt=md")
+        resp = await client.get("/api/tasks/export-me/export?fmt=md")
         assert resp.status_code == 200
         data = resp.json()
         assert "content" in data
@@ -108,7 +108,7 @@ class TestWebAPI:
             sections={"objective": "org test"},
             source_harness="h", source_model="m",
         )
-        resp = await client.post("/api/tasks/export-org/export?fmt=org")
+        resp = await client.get("/api/tasks/export-org/export?fmt=org")
         assert resp.status_code == 200
         data = resp.json()
         assert "#+title:" in data["content"]

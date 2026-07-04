@@ -209,6 +209,30 @@ class TestTransitions:
         assert task.updated_at >= before
 
 
+    def test_transition_task_enforces_illegal_move(self, db):
+        """transition_task raises ValueError for illegal transitions."""
+        task = db.create_task(
+            slug="illegal-move", title="Illegal", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+        )
+        with pytest.raises(ValueError, match="not allowed|Transition"):
+            db.transition_task(task.slug, "reviewed", "h", "m")
+
+    def test_create_task_with_stage_and_updated_at(self, db):
+        """create_task accepts optional stage and updated_at params."""
+        import datetime
+        ts = "2026-07-04T10:00:00Z"
+        task = db.create_task(
+            slug="with-params", title="With Params", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+            stage="done", updated_at=ts,
+        )
+        assert task.stage == "done"
+        assert task.updated_at == ts
+
+
 class TestSubmitGate:
     def _make_in_progress_with_sections(self, db, sections: dict | None = None):
         task = db.create_task(
@@ -403,4 +427,41 @@ class TestReviews:
             "accepted", "fine", "ok",
         )
         assert error is not None
-        assert "not awaiting review" in error
+        assert "only tasks in 'done' stage can be reviewed" in error
+
+    def test_changes_requested_clears_owner(self, db):
+        """changes-requested clears owner_harness/owner_model and sets destination to original owner."""
+        task = db.create_task(
+            slug="cr-owner", title="CR Owner", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+        )
+        db.claim_task(task.slug, "codex", "gpt-5")
+        db.transition_task(task.slug, "done", "codex", "gpt-5")
+        result, error = db.add_review(
+            task.slug, "opencode", "deepseek-v4",
+            "changes-requested", "Needs work", "revise",
+        )
+        assert error is None
+        assert result.stage == "todo"
+        assert result.owner_harness is None
+        assert result.owner_model is None
+        assert result.destination == "codex"
+
+    def test_human_revision_clears_owner(self, db):
+        """human-revision-required clears owner_harness/owner_model, destination unchanged."""
+        task = db.create_task(
+            slug="hr-owner", title="HR Owner", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+        )
+        db.claim_task(task.slug, "codex", "gpt-5")
+        db.transition_task(task.slug, "done", "codex", "gpt-5")
+        result, error = db.add_review(
+            task.slug, "opencode", "deepseek-v4",
+            "human-revision-required", "Need human", "escalate",
+        )
+        assert error is None
+        assert result.stage == "to-be-revised-by-human"
+        assert result.owner_harness is None
+        assert result.owner_model is None
