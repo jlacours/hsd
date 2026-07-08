@@ -1,6 +1,7 @@
 """Tests for the core database layer and domain rules."""
 
 import concurrent.futures
+import sqlite3
 import threading
 
 import pytest
@@ -191,6 +192,13 @@ class TestTransitions:
         db.transition_task(task.slug, "to-be-revised-by-human", "opencode", "deepseek-v4")
         result = db.transition_task(task.slug, "todo", "human", "human", note="fixed")
         assert result.stage == "todo"
+        assert result.owner_harness is None
+        assert result.owner_model is None
+        assert result.destination == "any"
+
+        claimed = db.claim_task(result.slug, "codex", "gpt-5.5")
+        assert claimed is not None
+        assert claimed.owner_harness == "codex"
 
     def test_transition_records_audit(self, db):
         task = self._make_in_progress(db)
@@ -306,17 +314,20 @@ class TestNoSelfReview:
 
 class TestSecretScan:
     def test_rejects_pem_key(self):
-        ok, err = validate_no_secrets("-----BEGIN RSA PRIVATE KEY-----\nABCD\n-----END RSA PRIVATE KEY-----")
+        fake_key = "-----BEGIN RSA " + "PRIVATE KEY-----\nABCD\n-----END RSA PRIVATE KEY-----"
+        ok, err = validate_no_secrets(fake_key)
         assert not ok
         assert "PEM" in err
 
     def test_rejects_github_pat(self):
-        ok, err = validate_no_secrets("use ghp_abcdefghijklmnopqrstuvwxyz1234567890")
+        fake_pat = "ghp_" + "abcdefghijklmnopqrstuvwxyz1234567890"
+        ok, err = validate_no_secrets(f"use {fake_pat}")
         assert not ok
         assert "ghp_" in err
 
     def test_rejects_aws_key(self):
-        ok, err = validate_no_secrets("AKIA0123456789ABCDEF")
+        fake_key = "AKIA" + "0123456789ABCDEF"
+        ok, err = validate_no_secrets(fake_key)
         assert not ok
         assert "AKIA" in err
 
@@ -465,3 +476,227 @@ class TestReviews:
         assert result.stage == "to-be-revised-by-human"
         assert result.owner_harness is None
         assert result.owner_model is None
+
+
+class TestClosedStage:
+    def _make_reviewed(self, db, slug="closed-flow"):
+        task = db.create_task(
+            slug=slug, title="Closed Flow", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+        )
+        db.claim_task(task.slug, "codex", "gpt-5")
+        db.transition_task(task.slug, "done", "codex", "gpt-5")
+        result, error = db.add_review(
+            task.slug, "opencode", "deepseek-v4",
+            "accepted", "Looks good", "approved",
+        )
+        assert error is None
+        assert result.stage == "reviewed"
+        return result
+
+    def test_reviewed_to_closed_allowed(self, db):
+        task = self._make_reviewed(db)
+        assert validate_transition(task, "closed") == (True, "")
+        result = db.transition_task(
+            task.slug, "closed", "human", "human", note="human review: accept",
+        )
+        assert result.stage == "closed"
+        assert result.status == "complete"
+
+    def test_reviewed_to_human_revision_allowed(self, db):
+        task = self._make_reviewed(db, slug="closed-flow-2")
+        assert validate_transition(task, "to-be-revised-by-human") == (True, "")
+        result = db.transition_task(
+            task.slug, "to-be-revised-by-human", "human", "human",
+            note="human review: revise",
+        )
+        assert result.stage == "to-be-revised-by-human"
+
+    def test_closed_has_no_outgoing_transitions(self, db):
+        task = self._make_reviewed(db, slug="closed-flow-3")
+        closed = db.transition_task(task.slug, "closed", "human", "human")
+        assert closed.stage == "closed"
+
+        for target in ("todo", "in-progress", "done", "reviewed", "to-be-revised-by-human"):
+            ok, reason = validate_transition(closed, target)
+            assert not ok
+            assert "not allowed" in reason
+
+        with pytest.raises(ValueError, match="not allowed"):
+            db.transition_task(closed.slug, "todo", "human", "human")
+
+        # the rejected attempt must not have mutated the task
+        unchanged = db.get_task(closed.slug)
+        assert unchanged.stage == "closed"
+
+
+class TestSubmitArtifacts:
+    def _make_in_progress(self, db, slug="artifact-task"):
+        task = db.create_task(
+            slug=slug, title="Artifact Task", destination="any",
+            sections={"objective": "test"},
+            source_harness="h", source_model="m",
+        )
+        db.claim_task(task.slug, "codex", "gpt-5")
+        return db.get_task(task.slug)
+
+    def test_submit_persists_diff_and_verify_cmd(self, db):
+        task = self._make_in_progress(db)
+        result = db.transition_task(
+            task.slug, "done", "codex", "gpt-5",
+            diff="diff --git a/f b/f\n+line", verify_cmd="pytest tests/",
+        )
+        assert result.diff == "diff --git a/f b/f\n+line"
+        assert result.verify_cmd == "pytest tests/"
+
+    def test_resubmit_overwrites_diff_and_verify_cmd(self, db):
+        task = self._make_in_progress(db, slug="resubmit-task")
+        db.transition_task(
+            task.slug, "done", "codex", "gpt-5",
+            diff="v1 diff", verify_cmd="pytest v1",
+        )
+        # simulate changes-requested: back to todo, re-claim, resubmit
+        db.transition_task(task.slug, "todo", "human", "human", note="changes requested")
+        db.claim_task(task.slug, "codex", "gpt-5")
+        result = db.transition_task(
+            task.slug, "done", "codex", "gpt-5",
+            diff="v2 diff", verify_cmd="pytest v2",
+        )
+        assert result.diff == "v2 diff"
+        assert result.verify_cmd == "pytest v2"
+
+    def test_resubmit_omitted_leaves_diff_and_verify_cmd_untouched(self, db):
+        task = self._make_in_progress(db, slug="omit-task")
+        db.transition_task(
+            task.slug, "done", "codex", "gpt-5",
+            diff="original diff", verify_cmd="original verify",
+        )
+        db.transition_task(task.slug, "todo", "human", "human")
+        db.claim_task(task.slug, "codex", "gpt-5")
+        result = db.transition_task(task.slug, "done", "codex", "gpt-5")
+        assert result.diff == "original diff"
+        assert result.verify_cmd == "original verify"
+
+    def test_submit_with_secret_in_diff_rejected(self, db):
+        task = self._make_in_progress(db, slug="secret-task")
+        fake_key = "AKIA" + "0123456789ABCDEF"
+        with pytest.raises(ValueError, match="Secret scan blocked"):
+            db.transition_task(
+                task.slug, "done", "codex", "gpt-5",
+                diff=f"key: {fake_key}",
+            )
+        unchanged = db.get_task(task.slug)
+        assert unchanged.stage == "in-progress"
+        assert unchanged.diff is None
+
+
+class TestLegacyMigration:
+    """A pre-'closed' (v2.0, five-stage) database must upgrade transparently."""
+
+    OLD_SCHEMA_SQL = """
+        CREATE TABLE tasks (
+            id              INTEGER PRIMARY KEY,
+            slug            TEXT NOT NULL UNIQUE,
+            title           TEXT NOT NULL,
+            destination     TEXT NOT NULL,
+            owner_harness   TEXT,
+            owner_model     TEXT,
+            stage           TEXT NOT NULL CHECK (stage IN
+                ('todo','in-progress','done','reviewed','to-be-revised-by-human')),
+            status          TEXT NOT NULL CHECK (status IN
+                ('queued','in-progress','blocked','complete')),
+            source_harness  TEXT NOT NULL,
+            source_model    TEXT NOT NULL,
+            model_check_note TEXT,
+            author          TEXT,
+            working_dir     TEXT,
+            repository      TEXT,
+            branch_commit   TEXT,
+            tree_state      TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        );
+
+        CREATE TABLE sections (
+            task_id   INTEGER NOT NULL REFERENCES tasks(id),
+            name      TEXT NOT NULL,
+            content   TEXT NOT NULL,
+            PRIMARY KEY (task_id, name)
+        );
+
+        CREATE TABLE transitions (
+            id            INTEGER PRIMARY KEY,
+            task_id       INTEGER NOT NULL REFERENCES tasks(id),
+            at            TEXT NOT NULL,
+            actor_harness TEXT NOT NULL,
+            actor_model   TEXT NOT NULL,
+            from_stage    TEXT,
+            to_stage      TEXT NOT NULL,
+            note          TEXT
+        );
+
+        CREATE TABLE reviews (
+            id                INTEGER PRIMARY KEY,
+            task_id           INTEGER NOT NULL REFERENCES tasks(id),
+            at                TEXT NOT NULL,
+            reviewer_harness  TEXT NOT NULL,
+            reviewer_model    TEXT NOT NULL,
+            verdict           TEXT NOT NULL,
+            findings          TEXT NOT NULL,
+            disposition       TEXT NOT NULL
+        );
+    """
+
+    def test_legacy_five_stage_schema_migrates_on_open(self, tmp_path):
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(self.OLD_SCHEMA_SQL)
+        conn.execute(
+            """INSERT INTO tasks (id, slug, title, destination, owner_harness,
+               owner_model, stage, status, source_harness, source_model,
+               created_at, updated_at)
+               VALUES (42, 'legacy-task', 'Legacy Task', 'any', 'codex', 'gpt-5',
+                       'reviewed', 'complete', 'h', 'm',
+                       '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"""
+        )
+        conn.execute(
+            """INSERT INTO sections (task_id, name, content)
+               VALUES (42, 'objective', 'legacy objective')"""
+        )
+        conn.execute(
+            """INSERT INTO transitions (task_id, at, actor_harness, actor_model,
+               from_stage, to_stage, note)
+               VALUES (42, '2026-01-01T00:00:00Z', 'h', 'm', NULL, 'todo', 'task created')"""
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening via Database() must trigger the additive column migration
+        # plus the CHECK-constraint rebuild (ALTER TABLE can't change CHECKs).
+        db = Database(db_path)
+
+        columns = {
+            row["name"] for row in db._conn().execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        assert "diff" in columns
+        assert "verify_cmd" in columns
+
+        table_sql = db._conn().execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+        ).fetchone()["sql"]
+        assert "'closed'" in table_sql
+
+        # Ids preserved, and FK-linked child rows survived the rebuild.
+        task = db.get_task(42)
+        assert task is not None
+        assert task.id == 42
+        assert task.slug == "legacy-task"
+        assert task.stage == "reviewed"
+        assert task.sections_dict()["objective"] == "legacy objective"
+        assert len(task.transitions) == 1
+
+        # The new reviewed -> closed transition must now work post-migration.
+        result = db.transition_task(42, "closed", "human", "human", note="human review: accept")
+        assert result.stage == "closed"
+        assert result.status == "complete"

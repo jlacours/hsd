@@ -54,6 +54,8 @@ class Task:
     repository: str | None = None
     branch_commit: str | None = None
     tree_state: str | None = None
+    diff: str | None = None
+    verify_cmd: str | None = None
     sections: list[Section] = field(default_factory=list)
     transitions: list[Transition] = field(default_factory=list)
     reviews: list[Review] = field(default_factory=list)
@@ -93,6 +95,8 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("in-progress", "to-be-revised-by-human"): "escalate",
     ("todo", "to-be-revised-by-human"): "escalate",
     ("to-be-revised-by-human", "todo"): "human-resolve",
+    ("reviewed", "closed"): "accept",
+    ("reviewed", "to-be-revised-by-human"): "request-human-revision",
 }
 
 # Review verdicts and their target stages

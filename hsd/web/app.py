@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +11,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from markdown_it import MarkdownIt
+from pydantic import BaseModel
 
 from hsd.core.db import Database
 from hsd.core.rules import validate_no_self_review
@@ -19,6 +22,14 @@ from hsd.render.org import render_task as render_org
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
+MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False})
+
+HUMAN_REVIEW_VERDICTS = {"accept": "closed", "revise": "to-be-revised-by-human"}
+
+
+class HumanReviewRequest(BaseModel):
+    verdict: str
+    note: str | None = None
 
 
 @asynccontextmanager
@@ -58,9 +69,9 @@ def create_app(db: Database | None = None) -> FastAPI:
         tasks = db.list_tasks(harness=harness, stage=stage, destination=destination)
         return [_task_summary(t) for t in tasks]
 
-    @app.get("/api/tasks/{slug}")
-    async def get_task(slug: str):
-        task = db.get_task(slug)
+    @app.get("/api/tasks/{slug_or_id}")
+    async def get_task(slug_or_id: str):
+        task = db.get_task(slug_or_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
         return _task_detail(task)
@@ -80,7 +91,7 @@ def create_app(db: Database | None = None) -> FastAPI:
                 for tr in task.transitions:
                     all_transitions.append({
                         "task_slug": task.slug,
-                        "task_title": task.title,
+                        "task_title": _display_title(task),
                         "at": tr.at,
                         "actor_harness": tr.actor_harness,
                         "actor_model": tr.actor_model,
@@ -91,13 +102,13 @@ def create_app(db: Database | None = None) -> FastAPI:
         all_transitions.sort(key=lambda x: x["at"], reverse=True)
         return all_transitions[:limit]
 
-    @app.post("/api/tasks/{slug}/resolve")
-    async def resolve_task(slug: str, note: str = "Resolved by human"):
-        task = db.get_task(slug)
+    @app.post("/api/tasks/{slug_or_id}/resolve")
+    async def resolve_task(slug_or_id: str, note: str = "Resolved by human"):
+        task = db.get_task(slug_or_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
         result = db.transition_task(
-            slug, "todo",
+            slug_or_id, "todo",
             actor_harness="human",
             actor_model="human",
             note=note,
@@ -105,9 +116,32 @@ def create_app(db: Database | None = None) -> FastAPI:
         _notify_clients(app)
         return _task_detail(result)
 
-    @app.get("/api/tasks/{slug}/export")
-    async def export_task(slug: str, fmt: str = "md"):
-        task = db.get_task(slug)
+    @app.post("/api/tasks/{slug_or_id}/human-review")
+    async def human_review_task(slug_or_id: str, body: HumanReviewRequest):
+        task = db.get_task(slug_or_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        to_stage = HUMAN_REVIEW_VERDICTS.get(body.verdict)
+        if to_stage is None:
+            raise HTTPException(status_code=400, detail=f"Invalid verdict: {body.verdict}")
+        note = f"human review: {body.verdict}"
+        if body.note:
+            note += f" — {body.note}"
+        try:
+            result = db.transition_task(
+                slug_or_id, to_stage,
+                actor_harness="human",
+                actor_model="human",
+                note=note,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        _notify_clients(app)
+        return _task_detail(result)
+
+    @app.get("/api/tasks/{slug_or_id}/export")
+    async def export_task(slug_or_id: str, fmt: str = "md"):
+        task = db.get_task(slug_or_id)
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
         if fmt == "md":
@@ -188,12 +222,14 @@ def _task_summary(task: "Task") -> dict:
     return {
         "id": task.id,
         "slug": task.slug,
-        "title": task.title,
+        "title": _display_title(task),
         "stage": task.stage,
         "status": task.status,
         "destination": task.destination,
         "owner_harness": task.owner_harness,
         "owner_model": task.owner_model,
+        "source_harness": task.source_harness,
+        "source_model": task.source_model,
         "age_hours": round(task.age_hours, 1),
         "staleness_hours": round(task.staleness_hours, 1),
         "created_at": task.created_at,
@@ -205,7 +241,7 @@ def _task_detail(task: "Task") -> dict:
     return {
         "id": task.id,
         "slug": task.slug,
-        "title": task.title,
+        "title": _display_title(task),
         "destination": task.destination,
         "owner_harness": task.owner_harness,
         "owner_model": task.owner_model,
@@ -219,9 +255,12 @@ def _task_detail(task: "Task") -> dict:
         "repository": task.repository,
         "branch_commit": task.branch_commit,
         "tree_state": task.tree_state,
+        "diff": task.diff,
+        "verify_cmd": task.verify_cmd,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "sections": {s.name: s.content for s in task.sections},
+        "sections_html": {s.name: MARKDOWN.render(s.content) for s in task.sections},
         "transitions": [
             {
                 "id": t.id,
@@ -247,6 +286,37 @@ def _task_detail(task: "Task") -> dict:
             for r in task.reviews
         ],
     }
+
+
+def _display_title(task: "Task") -> str:
+    """Remove legacy title suffixes that duplicate stored source metadata."""
+    parts = task.title.rsplit(" — ", 2)
+    if len(parts) != 3:
+        return task.title
+
+    title, harness, model = parts
+    if (
+        _normalize_harness(harness) == _normalize_harness(task.source_harness)
+        and _normalize_model(model) == _normalize_model(task.source_model)
+    ):
+        return title
+    return task.title
+
+
+def _normalize_harness(value: str) -> str:
+    value = re.sub(r"\([^)]*\)", "", value.lower())
+    value = re.sub(r"\bcli\b", "", value)
+    return re.sub(r"[^a-z0-9]", "", value)
+
+
+def _normalize_model(value: str) -> str:
+    value = value.strip()
+    quoted = re.match(r"^`([^`]+)`", value)
+    if quoted:
+        value = quoted.group(1)
+    else:
+        value = value.split(" (", 1)[0].strip().strip("`")
+    return value.lower()
 
 
 app = create_app()
