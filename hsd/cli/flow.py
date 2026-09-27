@@ -10,7 +10,6 @@ import click
 from hsd.core.db import Database
 from hsd.core.rules import (
     validate_transition,
-    validate_submit_gate,
     validate_no_self_review,
 )
 from hsd.core.secret_scan import validate_no_secrets
@@ -76,33 +75,20 @@ def submit(db: Database, slug_or_id: str, section: tuple[str, ...],
             click.echo(f"Error: could not read diff file '{diff_file}': {e}", err=True)
             sys.exit(1)
 
-    # Patch sections first
-    task = db.update_task(task.slug, section_patches=sections)
-    if task is None:
-        click.echo("Error: task not found after update", err=True)
-        sys.exit(1)
-
-    ok, reason = validate_submit_gate(task)
-    if not ok:
-        click.echo(f"Error: submit gate: {reason}", err=True)
-        sys.exit(1)
-
-    ok, reason = validate_transition(task, "done")
-    if not ok:
-        click.echo(f"Error: {reason}", err=True)
-        sys.exit(1)
-
     try:
-        result = db.transition_task(
-            task.slug, "done",
+        result = db.submit_task_for_review(
+            task.slug,
             actor_harness=task.owner_harness or "unknown",
             actor_model=task.owner_model or "unknown",
-            note="submitted for review",
+            sections=sections,
             diff=diff,
             verify_cmd=verify_cmd,
         )
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    if result is None:
+        click.echo("Error: task not found", err=True)
         sys.exit(1)
     click.echo(f"Submitted task: {result.slug} (now in done)")
 

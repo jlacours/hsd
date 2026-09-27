@@ -1,7 +1,10 @@
 """Task creation, lookup, update, and claim queries."""
 
+import uuid
+
 from hsd.core.db_connection import _immediate, _utcnow
 from hsd.core.models import Task
+from hsd.core.task_format import validate_task_creation, validate_task_sections
 
 
 class TaskQueriesMixin:
@@ -22,7 +25,17 @@ class TaskQueriesMixin:
         stage: str = "todo",
         updated_at: str | None = None,
     ) -> Task:
+        validate_task_creation(
+            slug=slug,
+            title=title,
+            destination=destination,
+            sections=sections,
+            source_harness=source_harness,
+            source_model=source_model,
+            model_check_note=model_check_note,
+        )
         now = updated_at or _utcnow()
+        herdr_session = f"hsd-{uuid.uuid4().hex[:16]}"
         status_map = {
             "todo": "queued",
             "in-progress": "in-progress",
@@ -38,12 +51,14 @@ class TaskQueriesMixin:
                 """INSERT INTO tasks
                    (slug, title, destination, stage, status, source_harness,
                     source_model, model_check_note, author, working_dir,
-                    repository, branch_commit, tree_state, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    repository, branch_commit, tree_state, herdr_session,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     slug, title, destination, stage, status,
                     source_harness, source_model, model_check_note,
                     author, working_dir, repository, branch_commit, tree_state,
+                    herdr_session,
                     now, now,
                 ),
             )
@@ -138,6 +153,7 @@ class TaskQueriesMixin:
                     (owner_model, task.id),
                 )
             if section_patches:
+                validate_task_sections(section_patches)
                 for name, content in section_patches.items():
                     self._validate_section_name(name)
                     conn.execute(
@@ -146,6 +162,39 @@ class TaskQueriesMixin:
                            ON CONFLICT(task_id, name) DO UPDATE SET content = excluded.content""",
                         (task.id, name, content),
                     )
+        return self.get_task(task.id)
+
+    def update_plan_if_current(
+        self,
+        slug_or_id: str | int,
+        expected_plan: str,
+        new_plan: str,
+    ) -> Task | None:
+        """Atomically update a plan only when the caller edited the current text."""
+        validate_task_sections({"plan": new_plan})
+        task = self.get_task(slug_or_id)
+        if task is None:
+            return None
+        now = _utcnow()
+        conn = self._conn()
+        with _immediate(conn):
+            row = conn.execute(
+                "SELECT content FROM sections WHERE task_id = ? AND name = 'plan'",
+                (task.id,),
+            ).fetchone()
+            current_plan = row["content"] if row else ""
+            if current_plan != expected_plan:
+                return None
+            conn.execute(
+                """INSERT INTO sections (task_id, name, content)
+                   VALUES (?, 'plan', ?)
+                   ON CONFLICT(task_id, name) DO UPDATE SET content = excluded.content""",
+                (task.id, new_plan),
+            )
+            conn.execute(
+                "UPDATE tasks SET updated_at = ? WHERE id = ?",
+                (now, task.id),
+            )
         return self.get_task(task.id)
 
     def claim_task(self, slug_or_id: str | int, harness: str, model: str) -> Task | None:

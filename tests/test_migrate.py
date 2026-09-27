@@ -90,6 +90,63 @@ None.
 
 
 class TestMigration:
+    def test_import_slug_collisions_preserve_both_tasks(self, db: Database, tmp_path):
+        todo = tmp_path / "for-any-harness" / "todo"
+        todo.mkdir(parents=True)
+        for filename, objective in (
+            ("Foo Bar.md", "First legacy task"),
+            ("foo-bar.md", "Second legacy task"),
+        ):
+            (todo / filename).write_text(
+                f"""# Handoff: {objective}
+
+## Objective
+
+{objective}
+
+## Current State
+
+Not imported.
+"""
+            )
+
+        migrator = Migrator(db)
+        first = migrator.migrate(str(tmp_path))
+        second = migrator.migrate(str(tmp_path))
+
+        assert first.imported == 2
+        assert first.skipped == 0
+        assert second.imported == 0
+        assert second.skipped == 2
+        tasks = db.list_tasks()
+        assert {task.sections_dict()["objective"] for task in tasks} == {
+            "First legacy task",
+            "Second legacy task",
+        }
+        assert any(task.slug == "foo-bar" for task in tasks)
+        assert any(task.slug.startswith("foo-bar-") for task in tasks)
+
+    def test_import_normalizes_legacy_format(self, db: Database, tmp_path):
+        todo = tmp_path / "for-any-harness" / "todo"
+        todo.mkdir(parents=True)
+        (todo / "Legacy Task 42.md").write_text(
+            """# Handoff: Legacy Task
+
+## Objective
+
+Import this old handoff.
+"""
+        )
+
+        result = Migrator(db).migrate(str(tmp_path))
+        assert result.errors == 0
+        assert result.imported == 1
+        task = db.get_task("legacy-task-42")
+        assert task is not None
+        assert task.source_model == "MODEL NOT EXPOSED"
+        assert task.model_check_note == "v1 import: source model metadata was not recorded"
+        assert task.sections_dict()["current_state"].startswith("(imported")
+
     def test_migrate_imports_tasks(self, db: Database, v1_board: Path):
         migrator = Migrator(db)
         result = migrator.migrate(str(v1_board))

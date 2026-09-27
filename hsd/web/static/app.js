@@ -2,13 +2,27 @@
 
 const API_BASE = '/api';
 
+function showFatalUiError(message) {
+  const main = document.getElementById('main');
+  if (!main) return;
+  main.innerHTML = `<div class="fatal-ui-error"><strong>Dashboard error</strong><pre>${esc(message)}</pre></div>`;
+}
+
+window.addEventListener('error', event => showFatalUiError(event.message || 'Unknown error'));
+window.addEventListener('unhandledrejection', event => {
+  showFatalUiError(event.reason?.stack || event.reason?.message || String(event.reason));
+});
+
 // ── State ──────────────────────────────────────────────────────────
 const state = {
   tasks: [],
   activity: [],
   stats: null,
+  profiles: {},
+  profileDrafts: {},
+  profilesDirty: false,
   selectedTask: null,
-  view: 'board',        // 'board' | 'needs-you' | 'activity' | 'stats' | 'lint' | 'settings'
+  view: 'board',        // board views plus 'author' and 'settings'
   theme: loadTheme(),
   settings: loadSettings(),
   drawerOpen: false,
@@ -16,6 +30,17 @@ const state = {
   paletteOpen: false,
   selection: new Set(),   // slugs of multi-selected cards (batch actions)
   _drag: null,            // { slugs: [...] } while a card drag is in flight
+  authorTask: null,
+  authorPlan: '',
+  authorDraft: emptyAuthorDraft(),
+  authorDirty: false,
+  authorSubmitting: false,
+  terminalSocket: null,
+  terminal: null,
+  terminalFit: null,
+  terminalResizeObserver: null,
+  terminalConnectGeneration: 0,
+  xtermAssetsPromise: null,
 };
 
 // ── Init ───────────────────────────────────────────────────────────
@@ -25,7 +50,10 @@ document.addEventListener('DOMContentLoaded', () => {
   setupKeyboard();
   setupDragAndDrop();
   setupGlobalListeners();
-  fetchAll();
+  fetchAll().then(() => {
+    const task = new URLSearchParams(location.search).get('task');
+    if (task) openAuthor(task);
+  });
 });
 
 // ── API ────────────────────────────────────────────────────────────
@@ -34,21 +62,44 @@ async function api(path, opts = {}) {
     headers: { 'Accept': 'application/json', ...opts.headers },
     ...opts,
   });
-  if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+  if (!res.ok) {
+    let detail = `Request failed (${res.status})`;
+    try {
+      const payload = await res.json();
+      if (typeof payload.detail === 'string') {
+        detail = payload.detail;
+      } else if (Array.isArray(payload.detail)) {
+        detail = payload.detail.map(item => {
+          const field = item.loc?.at(-1);
+          return `${field ? `${field}: ` : ''}${item.msg || 'invalid value'}`;
+        }).join('; ');
+      }
+    } catch {}
+    throw new Error(detail);
+  }
   return res.json();
 }
 
 async function fetchAll() {
   try {
-    const [tasks, activity, stats] = await Promise.all([
+    const [tasks, activity, stats, profiles] = await Promise.all([
       api('/tasks'),
       api('/activity?limit=50'),
       api('/stats'),
+      api('/agent-profiles'),
     ]);
     state.tasks = tasks;
     state.activity = activity;
     state.stats = stats;
-    render();
+    state.profiles = Object.fromEntries(profiles.map(p => [p.purpose, p]));
+    if (!state.profilesDirty) {
+      state.profileDrafts = Object.fromEntries(
+        profiles.map(p => [p.purpose, { provider: p.provider, model: p.model }])
+      );
+    }
+    if (!(state.view === 'author' && state.terminalSocket?.readyState === WebSocket.OPEN)) {
+      render();
+    }
   } catch (e) {
     console.error('Fetch error:', e);
   }
@@ -84,6 +135,11 @@ function applyTheme(t) {
 function toggleTheme() {
   state.theme = state.theme === 'dark' ? 'light' : 'dark';
   applyTheme(state.theme);
+  if (state.terminal) {
+    state.terminal.options.theme = state.theme === 'dark'
+      ? { background: '#0d1117', foreground: '#d9e1ea', cursor: '#8ab4f8' }
+      : { background: '#101418', foreground: '#e8edf2', cursor: '#8ab4f8' };
+  }
   render();
 }
 
@@ -106,11 +162,172 @@ function saveSettings() {
 
 // ── Navigation / Views ─────────────────────────────────────────────
 function switchView(view) {
+  if (state.view === 'author' && view !== 'author' && !authorCanDiscard()) return;
+  if (view !== 'author') disconnectTerminal();
   state.view = view;
   state.drawerOpen = false;
   state.drawerFullscreen = false;
   state.selectedTask = null;
   render();
+}
+
+function authorCanDiscard() {
+  if (state.authorSubmitting) {
+    showAuthorMessage('Task creation is still in progress.', true);
+    return false;
+  }
+  if (!state.authorDirty) return true;
+  if (!confirm('Discard unsaved task or plan changes?')) return false;
+  if (!state.authorTask) state.authorDraft = emptyAuthorDraft();
+  state.authorDirty = false;
+  return true;
+}
+
+function emptyAuthorDraft() {
+  return {
+    slug: '',
+    title: '',
+    destination: 'any',
+    working_dir: '',
+    repository: '',
+    objective: '',
+    current_state: '',
+    plan: '',
+  };
+}
+
+async function openAuthor(slug = null) {
+  if (state.view === 'author' && !authorCanDiscard()) return;
+  disconnectTerminal();
+  state.view = 'author';
+  state.drawerOpen = false;
+  state.selectedTask = null;
+  if (slug) {
+    await selectAuthorTask(slug);
+    return;
+  }
+  state.authorTask = null;
+  state.authorPlan = state.authorDraft.plan;
+  state.authorDirty = false;
+  render();
+}
+
+async function selectAuthorTask(slug) {
+  if (state.authorTask?.slug === slug) return;
+  if (!authorCanDiscard()) return;
+  disconnectTerminal();
+  try {
+    state.authorTask = await api(`/tasks/${encodeURIComponent(slug)}`);
+    state.authorPlan = state.authorTask.sections?.plan || '';
+    state.authorDirty = false;
+    state.view = 'author';
+    render();
+  } catch (e) {
+    showAuthorMessage(e.message, true);
+  }
+}
+
+function newAuthorTask() {
+  if (!authorCanDiscard()) return;
+  disconnectTerminal();
+  state.authorTask = null;
+  state.authorDraft = emptyAuthorDraft();
+  state.authorPlan = state.authorDraft.plan;
+  state.authorDirty = false;
+  render();
+}
+
+async function createAuthorTask() {
+  if (state.authorSubmitting) return;
+  const body = {
+    ...state.authorDraft,
+    plan: state.authorPlan,
+  };
+  document.querySelectorAll('[data-author-field]').forEach(input => {
+    input.removeAttribute('aria-invalid');
+  });
+  const rejectField = (field, message) => {
+    const input = document.querySelector(`[data-author-field="${field}"]`);
+    input?.setAttribute('aria-invalid', 'true');
+    input?.focus();
+    showAuthorMessage(message, true);
+  };
+  if (!/^[a-z][a-z0-9-]*$/.test(body.slug.trim())) {
+    rejectField('slug', 'Slug must be kebab-case: lowercase letters, digits, and hyphens.');
+    return;
+  }
+  for (const [field, label] of [
+    ['title', 'Title'],
+    ['destination', 'Destination'],
+    ['objective', 'Objective'],
+    ['current_state', 'Current State'],
+  ]) {
+    if (!body[field]?.trim()) {
+      rejectField(field, `${label} is required by the HSD task format.`);
+      return;
+    }
+  }
+  state.authorSubmitting = true;
+  document.querySelector('.author-fields')?.setAttribute('disabled', '');
+  const planEditor = document.getElementById('author-plan');
+  if (planEditor) planEditor.disabled = true;
+  const submit = document.getElementById('author-submit');
+  if (submit) {
+    submit.disabled = true;
+    submit.textContent = 'Creating…';
+  }
+  try {
+    const task = await api('/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    disconnectTerminal();
+    state.authorTask = task;
+    state.authorPlan = task.sections?.plan || '';
+    state.authorDraft = emptyAuthorDraft();
+    state.authorDirty = false;
+    await fetchAll();
+    showAuthorMessage('Task created on the board.');
+  } catch (e) {
+    showAuthorMessage(e.message, true);
+  } finally {
+    state.authorSubmitting = false;
+    document.querySelector('.author-fields')?.removeAttribute('disabled');
+    const currentPlanEditor = document.getElementById('author-plan');
+    if (currentPlanEditor) currentPlanEditor.disabled = false;
+    const currentSubmit = document.getElementById('author-submit');
+    if (currentSubmit) {
+      currentSubmit.disabled = false;
+      currentSubmit.textContent = state.authorTask ? 'Save plan' : 'Create task';
+    }
+  }
+}
+
+async function saveAuthorPlan() {
+  if (!state.authorTask) return createAuthorTask();
+  try {
+    state.authorTask = await api(`/tasks/${encodeURIComponent(state.authorTask.slug)}/plan`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        plan: state.authorPlan,
+        expected_plan: state.authorTask.sections?.plan || '',
+      }),
+    });
+    state.authorDirty = false;
+    await fetchAll();
+    showAuthorMessage('Plan saved.');
+  } catch (e) {
+    showAuthorMessage(e.message, true);
+  }
+}
+
+function showAuthorMessage(message, error = false) {
+  const el = document.getElementById('author-message');
+  if (!el) return;
+  el.textContent = message;
+  el.className = `author-message${error ? ' error' : ''}`;
 }
 
 // ── Task Drawer ────────────────────────────────────────────────────
@@ -363,6 +580,7 @@ function renderPalette() {
   function filterTasks(query) {
     const q = query.toLowerCase();
     const commands = [
+      { label: 'Add Task', action: () => { openAuthor(); closePalette(); }, keys: 'n' },
       { label: 'Go to Board', action: () => { switchView('board'); closePalette(); }, keys: 'g b' },
       { label: 'Go to Needs You', action: () => { switchView('needs-you'); closePalette(); }, keys: 'g n' },
       { label: 'Go to Activity', action: () => { switchView('activity'); closePalette(); }, keys: 'g a' },
@@ -459,6 +677,11 @@ function setupKeyboard() {
     if (e.ctrlKey && e.key === 'k') {
       e.preventDefault();
       openPalette();
+      return;
+    }
+
+    if (e.key === 'n' && !state.drawerOpen && !state.paletteOpen) {
+      openAuthor();
       return;
     }
 
@@ -602,11 +825,22 @@ function setupGlobalListeners() {
       copyValue(copyButton);
     }
   });
+
+  window.addEventListener('beforeunload', event => {
+    if (!state.authorDirty) return;
+    event.preventDefault();
+    event.returnValue = '';
+  });
 }
 
 // ── Rendering ──────────────────────────────────────────────────────
 function render() {
   renderHeader();
+  if (
+    state.view === 'author' &&
+    state.terminalSocket &&
+    state.terminalSocket.readyState <= WebSocket.OPEN
+  ) return;
   renderSidebar();
   renderMain();
 }
@@ -621,7 +855,7 @@ function renderHeader() {
 function renderSidebar() {
   const sidebar = document.getElementById('sidebar');
   if (!sidebar) return;
-  sidebar.classList.toggle('hidden', !state.settings.showSidebar);
+  sidebar.classList.toggle('hidden', !state.settings.showSidebar || state.view === 'author');
 
   let html = `<h2>Needs You</h2>`;
 
@@ -654,6 +888,7 @@ function renderSidebar() {
 function renderMain() {
   const main = document.getElementById('main');
   if (!main) return;
+  main.classList.toggle('author-active', state.view === 'author');
 
   let html = '';
 
@@ -675,6 +910,9 @@ function renderMain() {
       break;
     case 'settings':
       html = renderSettings();
+      break;
+    case 'author':
+      html = renderAuthor();
       break;
   }
 
@@ -729,6 +967,30 @@ function renderMain() {
         saveSettings();
       }
       render();
+    });
+  });
+
+  main.querySelectorAll('[data-author-field]').forEach(el => {
+    el.addEventListener('input', () => {
+      state.authorDraft[el.dataset.authorField] = el.value;
+      state.authorDirty = true;
+    });
+  });
+
+  document.getElementById('author-plan')?.addEventListener('input', (event) => {
+    state.authorPlan = event.target.value;
+    if (!state.authorTask) state.authorDraft.plan = event.target.value;
+    state.authorDirty = true;
+    const count = document.getElementById('plan-count');
+    if (count) count.textContent = `${event.target.value.length} characters`;
+  });
+
+  main.querySelectorAll('[data-profile-purpose]').forEach(input => {
+    input.addEventListener('input', () => {
+      const purpose = input.dataset.profilePurpose;
+      state.profileDrafts[purpose] ||= { provider: '', model: '' };
+      state.profileDrafts[purpose][input.dataset.profileField] = input.value;
+      state.profilesDirty = true;
     });
   });
 }
@@ -922,8 +1184,360 @@ function renderSettings() {
       ${settingToggle('openTasksFullscreen', 'Open tasks fullscreen', 'Use the full viewport when inspecting task details and Markdown.')}
       ${settingToggle('showSourceModelFallback', 'Show source-model fallback', 'Show the source model on cards when no current owner model was recorded.')}
     </div>
-    <p class="settings-note">Settings are stored locally in this browser.</p>
+    <div class="settings-heading profile-heading">
+      <h2>Workflow Models</h2>
+      <p>Provider and model defaults shared by the authoring terminal and future HSD automation.</p>
+    </div>
+    <div class="settings-panel profile-settings">
+      ${['planning', 'coding', 'reviewing', 'bugs', 'maintenance'].map(profileRow).join('')}
+      <div class="profile-actions">
+        <span id="profile-message" class="text-sm text-secondary" role="status" aria-live="polite"></span>
+        <button class="btn primary" onclick="saveAgentProfiles()">Save workflow models</button>
+      </div>
+    </div>
+    <p class="settings-note">Display settings stay in this browser. Workflow models are stored in the HSD database.</p>
   </div>`;
+}
+
+function profileRow(purpose) {
+  const profile = state.profileDrafts[purpose] || state.profiles[purpose] || { provider: '', model: '' };
+  return `<div class="profile-row">
+    <div class="profile-purpose">
+      <strong>${profilePurposeLabel(purpose)}</strong>
+      <small>${profilePurposeDescription(purpose)}</small>
+    </div>
+    <label>
+      <span>Provider</span>
+      <input type="text" data-profile-purpose="${purpose}" data-profile-field="provider" value="${escAttr(profile.provider)}" placeholder="openai, anthropic, openrouter…">
+    </label>
+    <label>
+      <span>Model</span>
+      <input type="text" data-profile-purpose="${purpose}" data-profile-field="model" value="${escAttr(profile.model)}" placeholder="Exact model identifier">
+    </label>
+  </div>`;
+}
+
+function profilePurposeLabel(purpose) {
+  return {
+    planning: 'Planning',
+    coding: 'Coding',
+    reviewing: 'Reviewing',
+    bugs: 'Bugs',
+    maintenance: 'Maintenance',
+  }[purpose] || purpose;
+}
+
+function profilePurposeDescription(purpose) {
+  return {
+    planning: 'Shape a task and produce its written plan.',
+    coding: 'Implement scoped feature work.',
+    reviewing: 'Inspect completed work independently.',
+    bugs: 'Diagnose and repair regressions or incidents.',
+    maintenance: 'Handle upgrades, cleanup, and routine upkeep.',
+  }[purpose] || '';
+}
+
+async function saveAgentProfiles() {
+  const message = document.getElementById('profile-message');
+  try {
+    const profiles = await api('/agent-profiles', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profiles: state.profileDrafts }),
+    });
+    state.profiles = Object.fromEntries(profiles.map(p => [p.purpose, p]));
+    state.profileDrafts = Object.fromEntries(
+      profiles.map(p => [p.purpose, { provider: p.provider, model: p.model }])
+    );
+    state.profilesDirty = false;
+    if (message) message.textContent = 'Saved.';
+  } catch (e) {
+    if (message) message.textContent = e.message;
+  }
+}
+
+function renderAuthor() {
+  const task = state.authorTask;
+  const draft = state.authorDraft;
+  const cwd = task?.working_dir || draft.working_dir || '';
+  const selectedSlug = task?.slug || '';
+  const authorLocked = state.authorSubmitting ? ' disabled' : '';
+  return `<div class="author-workspace">
+    <aside class="author-tasks">
+      <div class="author-panel-heading">
+        <div>
+          <span class="eyebrow">Board</span>
+          <h2>Tasks</h2>
+        </div>
+        <button class="btn primary" onclick="newAuthorTask()">+ New</button>
+      </div>
+      <div class="author-task-list">
+        ${state.tasks.map(item => `<button class="author-task${item.slug === selectedSlug ? ' active' : ''}" onclick="selectAuthorTask('${escAttr(item.slug)}')"${item.slug === selectedSlug ? ' aria-current="true"' : ''}>
+          <strong>${esc(item.title)}</strong>
+          <span><i class="stage-dot stage-${escAttr(item.stage)}"></i>${esc(item.stage)} · #${item.id}</span>
+        </button>`).join('') || '<div class="empty-state">No tasks yet.</div>'}
+      </div>
+    </aside>
+    <section class="author-plan-panel">
+      <div class="author-panel-heading">
+        <div>
+          <span class="eyebrow">${task ? `Task #${task.id}` : 'New task'}</span>
+          <h2>${task ? esc(task.title) : 'Write the plan'}</h2>
+        </div>
+        ${task ? `<button class="btn" onclick="openDrawer('${escAttr(task.slug)}')">Details</button>` : ''}
+      </div>
+      ${task ? `<div class="author-task-context">
+          <span class="chip stage-${escAttr(task.stage)}">${esc(task.stage)}</span>
+          <code>${esc(task.slug)}</code>
+          <span>${esc(task.destination)}</span>
+          <button class="session-id" data-copy-value="${escAttr(task.herdr_session)}" title="Copy Herdr session name">${esc(task.herdr_session)}</button>
+        </div>` : `<fieldset class="author-fields"${authorLocked}>
+          <label><span>Title</span><input data-author-field="title" value="${escAttr(draft.title)}" placeholder="What needs doing?"></label>
+          <label><span>Slug</span><input data-author-field="slug" value="${escAttr(draft.slug)}" placeholder="kebab-case-task-name"></label>
+          <label><span>Destination</span><input data-author-field="destination" value="${escAttr(draft.destination)}" placeholder="any"></label>
+          <label><span>Working directory</span><input data-author-field="working_dir" value="${escAttr(draft.working_dir)}" placeholder="/path/to/project"></label>
+          <label class="wide"><span>Repository</span><input data-author-field="repository" value="${escAttr(draft.repository)}" placeholder="Optional repository URL or path"></label>
+          <label class="wide"><span>Objective · required</span><textarea data-author-field="objective" rows="3" placeholder="Define the concrete outcome this task must achieve." required>${esc(draft.objective)}</textarea></label>
+          <label class="wide"><span>Current state · required</span><textarea data-author-field="current_state" rows="3" placeholder="Describe what exists now, including constraints or the failure being addressed." required>${esc(draft.current_state)}</textarea></label>
+          <p class="author-format-note wide">Canonical creation format: Objective and Current State are required. The plan can start empty and be written with the planning session.</p>
+        </fieldset>`}
+      <label class="plan-editor-label" for="author-plan">Markdown plan</label>
+      <textarea id="author-plan" class="plan-editor" spellcheck="true" placeholder="# Goal\n\nDescribe the outcome, constraints, and acceptance checks…"${authorLocked}>${esc(state.authorPlan)}</textarea>
+      <div class="plan-footer">
+        <span id="plan-count">${state.authorPlan.length} characters</span>
+        <div class="flex gap-2 items-center">
+          <span id="author-message" class="author-message" role="status" aria-live="polite"></span>
+          <button id="author-submit" class="btn primary" onclick="saveAuthorPlan()"${authorLocked}>${task ? 'Save plan' : 'Create task'}</button>
+        </div>
+      </div>
+    </section>
+    <section class="author-terminal-panel">
+      <div class="author-panel-heading terminal-heading">
+        <div>
+          <span class="eyebrow">PTY session</span>
+          <h2>Terminal</h2>
+        </div>
+        <div class="flex gap-2">
+          <button class="btn primary" onclick="connectHerdr()">Open / Resume Herdr</button>
+          <button class="btn" onclick="connectTerminal()">Shell</button>
+          <button class="btn" onclick="disconnectTerminal()">Disconnect</button>
+        </div>
+      </div>
+      <div class="terminal-controls">
+        <label><span>Activity</span><select id="terminal-purpose">
+          ${['planning', 'coding', 'reviewing', 'bugs', 'maintenance'].map(purpose => {
+            const profile = state.profiles[purpose] || {};
+            const suffix = profile.provider || profile.model ? ` — ${[profile.provider, profile.model].filter(Boolean).join('/')}` : ' — unset';
+            return `<option value="${purpose}">${profilePurposeLabel(purpose)}${esc(suffix)}</option>`;
+          }).join('')}
+        </select></label>
+        <label><span>Working directory</span><input id="terminal-cwd" value="${escAttr(cwd)}" placeholder="Defaults to home"></label>
+      </div>
+      <div id="terminal-status" class="terminal-status" role="status" aria-live="polite">Disconnected</div>
+      <div id="terminal-host" class="terminal-host" tabindex="0">
+        <div class="terminal-placeholder">Open the task's persistent Herdr session, or start a plain local shell. The selected provider/model are exported as HSD_PROVIDER and HSD_MODEL.</div>
+      </div>
+      <div id="terminal-fallback-input-wrap" class="terminal-fallback-input-wrap hidden">
+        <span>$</span><input id="terminal-fallback-input" aria-label="Terminal command" autocomplete="off" spellcheck="false">
+      </div>
+    </section>
+  </div>`;
+}
+
+function connectHerdr() {
+  if (!state.authorTask) {
+    showAuthorMessage('Create the task before starting its persistent Herdr session.', true);
+    return;
+  }
+  connectTerminal(true);
+}
+
+function loadTerminalScript(src, integrity) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.integrity = integrity;
+    script.crossOrigin = 'anonymous';
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+function loadTerminalStyles(src, integrity) {
+  return new Promise((resolve, reject) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = src;
+    link.integrity = integrity;
+    link.crossOrigin = 'anonymous';
+    link.onload = resolve;
+    link.onerror = () => reject(new Error(`Could not load ${src}`));
+    document.head.appendChild(link);
+  });
+}
+
+function ensureTerminalAssets() {
+  if (window.Terminal && window.FitAddon?.FitAddon) return Promise.resolve(true);
+  if (!state.xtermAssetsPromise) {
+    state.xtermAssetsPromise = Promise.all([
+      loadTerminalStyles(
+        'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css',
+        'sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh'
+      ),
+      loadTerminalScript(
+      'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js',
+      'sha384-/nfmYPUzWMS6v2atn8hbljz7NE0EI1iGx34lJaNzyVjWGDzMv+ciUZUeJpKA3Glc'
+      ),
+    ]).then(() => loadTerminalScript(
+      'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js',
+      'sha384-AQLWHRKAgdTxkolJcLOELg4E9rE89CPE2xMy3tIRFn08NcGKPTsELdvKomqji+DL'
+    )).then(() => true).catch(error => {
+      console.warn('xterm unavailable; using basic console fallback:', error);
+      return false;
+    });
+  }
+  return state.xtermAssetsPromise;
+}
+
+async function connectTerminal(openHerdr = false) {
+  disconnectTerminal();
+  const generation = state.terminalConnectGeneration;
+  const initialStatus = document.getElementById('terminal-status');
+  if (initialStatus) initialStatus.textContent = 'Loading terminal…';
+  const terminalAssetsReady = await ensureTerminalAssets();
+  if (generation !== state.terminalConnectGeneration) return;
+  const purpose = document.getElementById('terminal-purpose')?.value || 'planning';
+  const profile = state.profiles[purpose] || { provider: '', model: '' };
+  const cwd = document.getElementById('terminal-cwd')?.value || '';
+  const taskId = state.authorTask?.id || '';
+  const herdrSession = state.authorTask?.herdr_session || '';
+  const params = new URLSearchParams({
+    purpose,
+    task_id: taskId,
+  });
+  if (cwd) params.set('cwd', cwd);
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.host}/ws/terminal?${params}`);
+  socket.binaryType = 'arraybuffer';
+  state.terminalSocket = socket;
+  const host = document.getElementById('terminal-host');
+  const status = document.getElementById('terminal-status');
+  if (!host || !status) return;
+  host.innerHTML = '';
+  status.textContent = `Connecting${openHerdr ? ' to Herdr' : ''} · ${profilePurposeLabel(purpose)} · ${[profile.provider, profile.model].filter(Boolean).join('/') || 'profile unset'}`;
+
+  if (terminalAssetsReady && window.Terminal && window.FitAddon?.FitAddon) {
+    state.terminal = new window.Terminal({
+      cursorBlink: true,
+      convertEol: false,
+      fontFamily: 'var(--font-mono)',
+      fontSize: 13,
+      theme: state.theme === 'dark'
+        ? { background: '#0d1117', foreground: '#d9e1ea', cursor: '#8ab4f8' }
+        : { background: '#101418', foreground: '#e8edf2', cursor: '#8ab4f8' },
+    });
+    state.terminalFit = new window.FitAddon.FitAddon();
+    state.terminal.loadAddon(state.terminalFit);
+    state.terminal.open(host);
+    state.terminalFit?.fit();
+    if (window.ResizeObserver) {
+      state.terminalResizeObserver = new ResizeObserver(() => {
+        if (state.terminalSocket !== socket || !state.terminalFit) return;
+        state.terminalFit.fit();
+      });
+      state.terminalResizeObserver.observe(host);
+    }
+    state.terminal.onData(data => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'input', data }));
+      }
+    });
+    state.terminal.onResize(({ rows, cols }) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'resize', rows, cols }));
+      }
+    });
+  } else {
+    host.innerHTML = '<pre id="terminal-fallback-output" class="terminal-fallback-output"></pre>';
+    const fallbackWrap = document.getElementById('terminal-fallback-input-wrap');
+    const fallbackInput = document.getElementById('terminal-fallback-input');
+    fallbackWrap?.classList.remove('hidden');
+    if (fallbackInput) fallbackInput.onkeydown = event => {
+      if (event.key !== 'Enter' || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({ type: 'input', data: `${event.target.value}\r` }));
+      event.target.value = '';
+    };
+  }
+
+  socket.onopen = () => {
+    if (state.terminalSocket !== socket) {
+      socket.close();
+      return;
+    }
+    status.textContent = `${openHerdr ? `Herdr · ${herdrSession}` : 'Shell'} · ${profilePurposeLabel(purpose)} · ${[profile.provider, profile.model].filter(Boolean).join('/') || 'profile unset'}`;
+    state.terminalFit?.fit();
+    if (state.terminal) {
+      socket.send(JSON.stringify({ type: 'resize', rows: state.terminal.rows, cols: state.terminal.cols }));
+      state.terminal.focus();
+    }
+    if (openHerdr) {
+      socket.send(JSON.stringify({
+        type: 'input',
+        data: `herdr --session ${herdrSession}\r`,
+      }));
+    }
+  };
+  socket.onmessage = async event => {
+    if (state.terminalSocket !== socket) return;
+    const data = event.data instanceof ArrayBuffer
+      ? new Uint8Array(event.data)
+      : typeof event.data === 'string'
+        ? event.data
+        : new Uint8Array(await event.data.arrayBuffer());
+    if (state.terminal) {
+      state.terminal.write(data);
+    } else {
+      const output = document.getElementById('terminal-fallback-output');
+      if (output) {
+        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+        output.textContent += text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+        output.parentElement.scrollTop = output.parentElement.scrollHeight;
+      }
+    }
+  };
+  socket.onclose = event => {
+    if (state.terminalSocket !== socket) return;
+    state.terminalSocket = null;
+    status.textContent = event.code === 1008 ? 'Terminal rejected the directory or origin.' : 'Disconnected';
+  };
+  socket.onerror = () => {
+    if (state.terminalSocket !== socket) return;
+    status.textContent = 'Terminal connection failed.';
+  };
+}
+
+function disconnectTerminal() {
+  state.terminalConnectGeneration += 1;
+  if (state.terminalSocket) {
+    state.terminalSocket.close(1000, 'Stopped by user');
+    state.terminalSocket = null;
+  }
+  if (state.terminal) {
+    state.terminal.dispose();
+    state.terminal = null;
+  }
+  if (state.terminalResizeObserver) {
+    state.terminalResizeObserver.disconnect();
+    state.terminalResizeObserver = null;
+  }
+  state.terminalFit = null;
+  const fallbackWrap = document.getElementById('terminal-fallback-input-wrap');
+  const fallbackInput = document.getElementById('terminal-fallback-input');
+  fallbackWrap?.classList.add('hidden');
+  if (fallbackInput) fallbackInput.onkeydown = null;
+  const status = document.getElementById('terminal-status');
+  if (status) status.textContent = 'Disconnected';
 }
 
 function settingToggle(key, label, description) {
@@ -1064,6 +1678,7 @@ function renderDiffSection(task) {
 function sectionLabel(name) {
   const labels = {
     'objective': 'Objective',
+    'plan': 'Plan',
     'current_state': 'Current State',
     'summary_for_review': 'Summary for Review',
     'work_completed': 'Work Completed',

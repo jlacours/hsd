@@ -23,20 +23,38 @@ from hsd.cli._shared import PASS_DB, _parse_sections, _resolve_task, cli
 @click.option("--repository", default=None)
 @click.option("--branch-commit", default=None)
 @click.option("--tree-state", default=None)
+@click.option("--objective", default=None, help="Required task objective (or use -s objective=...)")
+@click.option("--current-state", default=None, help="Required starting state (or use -s current_state=...)")
+@click.option("--plan", default=None, help="Optional initial Markdown plan (or use -s plan=...)")
 @click.option("--section", "-s", multiple=True, help="section=content (can repeat)")
 @PASS_DB
 def create(db: Database, slug: str, title: str, destination: str,
            source_harness: str, source_model: str, model_check_note: str | None,
            author: str | None, working_dir: str | None, repository: str | None,
            branch_commit: str | None, tree_state: str | None,
+           objective: str | None, current_state: str | None, plan: str | None,
            section: tuple[str, ...]) -> None:
-    """Create a task whose TITLE excludes harness and model metadata."""
+    """Create a canonical task; Objective and Current State are required."""
     # Validate model note
     if source_model == "MODEL NOT EXPOSED" and not model_check_note:
         click.echo("Error: --model-check-note is required when source-model is 'MODEL NOT EXPOSED'", err=True)
         sys.exit(1)
 
     sections = _parse_sections(section)
+    for name, value in (
+        ("objective", objective),
+        ("current_state", current_state),
+        ("plan", plan),
+    ):
+        if value is None:
+            continue
+        if name in sections:
+            click.echo(
+                f"Error: {name} was provided both as an option and --section",
+                err=True,
+            )
+            sys.exit(1)
+        sections[name] = value
 
     # Secret scan
     all_text = " ".join(sections.values())
@@ -88,7 +106,15 @@ def update(db: Database, slug_or_id: str,
         click.echo(f"Error: {err}", err=True)
         sys.exit(1)
 
-    result = db.update_task(task.slug, section_patches=sections or None, status=status)
+    try:
+        result = db.update_task(
+            task.slug,
+            section_patches=sections or None,
+            status=status,
+        )
+    except ValueError as error:
+        click.echo(f"Error: {error}", err=True)
+        sys.exit(1)
     if result is None:
         click.echo("Error: task not found", err=True)
         sys.exit(1)

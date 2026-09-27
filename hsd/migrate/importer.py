@@ -3,10 +3,12 @@
 import os
 import re
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from hsd.core.db import Database
+from hsd.core.task_format import canonicalize_slug
 
 logger = logging.getLogger(__name__)
 
@@ -184,15 +186,13 @@ class Migrator:
             content = md_path.read_text(encoding="utf-8")
 
             # Extract slug from filename
-            slug = self._extract_slug(md_path)
-            if slug is None:
+            base_slug = self._extract_slug(md_path)
+            if base_slug is None:
                 result.errors += 1
                 result.error_details.append(f"Cannot extract slug from filename: {md_path}")
                 return
-
-            # Check if already imported
-            existing = self.db.get_task(slug)
-            if existing is not None:
+            slug, already_imported = self._resolve_import_slug(base_slug, md_path)
+            if already_imported:
                 result.skipped += 1
                 return
 
@@ -207,8 +207,11 @@ class Migrator:
             created_at = self._extract_timestamp(md_path)
 
             # Determine source_harness and source_model from metadata
-            source_harness = metadata.get("source harness", harness_name)
-            source_model = metadata.get("model", "MODEL NOT EXPOSED")
+            source_harness = metadata.get("source harness") or harness_name
+            source_model = metadata.get("model") or "MODEL NOT EXPOSED"
+            model_check_note = None
+            if source_model == "MODEL NOT EXPOSED":
+                model_check_note = "v1 import: source model metadata was not recorded"
             author = metadata.get("author/agent")
             working_dir = metadata.get("working directory")
             repository_meta = metadata.get("repository")
@@ -226,16 +229,17 @@ class Migrator:
             file_ts = self._extract_timestamp(md_path)
 
             # Store original path as artifact
+            source_path = md_path.resolve()
             artifacts = sections.get("artifacts", "")
             if artifacts:
-                artifacts = f"- Original: {md_path}\n" + artifacts
+                artifacts = f"- Original: {source_path}\n" + artifacts
             else:
-                artifacts = f"- Original: {md_path}"
+                artifacts = f"- Original: {source_path}"
             sections["artifacts"] = artifacts
 
             # Ensure minimum required sections
             for required in ("objective", "current_state"):
-                if required not in sections:
+                if required not in sections or not sections[required].strip():
                     sections[required] = "(imported — content not parsed from v1)"
 
             # If nothing was parsed into known sections, put everything in raw
@@ -249,6 +253,7 @@ class Migrator:
                 sections=sections,
                 source_harness=source_harness,
                 source_model=source_model,
+                model_check_note=model_check_note,
                 author=author,
                 working_dir=working_dir,
                 repository=repository_meta,
@@ -278,9 +283,38 @@ class Migrator:
     def _extract_slug(md_path: Path) -> str | None:
         m = SLUG_FILENAME_RE.match(md_path.name)
         if m:
-            return m.group(1)
+            return canonicalize_slug(m.group(1))
         # Fallback: use stem
-        return md_path.stem.replace("_", "-")
+        return canonicalize_slug(md_path.stem)
+
+    def _resolve_import_slug(self, base_slug: str, md_path: Path) -> tuple[str, bool]:
+        """Return a stable unique slug and whether this exact file was imported."""
+        source_paths = {str(md_path), str(md_path.resolve())}
+
+        def same_source(task) -> bool:
+            artifacts = task.sections_dict().get("artifacts", "")
+            originals = {
+                line.removeprefix("- Original:").strip()
+                for line in artifacts.splitlines()
+                if line.startswith("- Original:")
+            }
+            return not originals.isdisjoint(source_paths)
+
+        existing = self.db.get_task(base_slug)
+        if existing is None:
+            return base_slug, False
+        if same_source(existing):
+            return base_slug, True
+
+        digest = hashlib.sha256(str(md_path.resolve()).encode()).hexdigest()
+        for length in (8, 12, 16, 24, 32, 64):
+            candidate = f"{base_slug}-{digest[:length]}"
+            existing = self.db.get_task(candidate)
+            if existing is None:
+                return candidate, False
+            if same_source(existing):
+                return candidate, True
+        raise ValueError(f"could not resolve a unique import slug for {md_path}")
 
     @staticmethod
     def _parse_metadata(content: str) -> dict[str, str]:

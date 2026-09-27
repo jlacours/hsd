@@ -2,6 +2,8 @@
 
 from mcp.types import Tool
 
+from hsd.core.task_format import CANONICAL_SECTION_NAMES
+
 INSTRUCTIONS = """# HSD Protocol v2
 
 This MCP server manages a shared task board backed by SQLite. Tasks represent
@@ -19,6 +21,8 @@ coding handoffs that flow through stages: todo -> in-progress -> done -> reviewe
 8. **resolve_human_action** -- to-be-revised-by-human -> todo.
 
 ## Rules
+- Creation requires a kebab-case slug plus non-empty objective and current_state sections.
+- plan is optional at creation so planning can continue after the task is persisted.
 - Claim is atomic: exactly one harness wins.
 - No self-review: reviewer harness must differ from owner harness.
 - Owner-only: update_task and submit_for_review require caller identity.
@@ -68,8 +72,13 @@ def _get_tools() -> list[Tool]:
                     "destination": {"type": "string", "description": "Target harness or 'any'"},
                     "sections": {
                         "type": "object",
-                        "description": "Section name -> markdown content",
-                        "additionalProperties": {"type": "string"},
+                        "description": "Canonical HSD sections. Objective and current_state must be non-empty; plan may initially be empty.",
+                        "properties": {
+                            name: {"type": "string"}
+                            for name in CANONICAL_SECTION_NAMES
+                        },
+                        "required": ["objective", "current_state"],
+                        "additionalProperties": False,
                     },
                     "source_harness": {"type": "string", "description": "Your harness name"},
                     "source_model": {"type": "string", "description": "Your model identifier"},

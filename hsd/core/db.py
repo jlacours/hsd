@@ -11,6 +11,7 @@ from pathlib import Path
 from hsd.core.db_connection import ConnectionMixin, _immediate, _utcnow
 from hsd.core.db_schema import SCHEMA_SQL, TASKS_COLUMNS, TASKS_TABLE_BODY
 from hsd.core.db_tasks import TaskQueriesMixin
+from hsd.core.db_profiles import AgentProfileQueriesMixin
 from hsd.core.db_workflow import WorkflowQueriesMixin
 from hsd.core.models import Review, Section, Task, Transition
 from hsd.core.rules import validate_transition
@@ -28,7 +29,12 @@ def get_default_db_path() -> str:
     return str(db_dir / "hsd.db")
 
 
-class Database(TaskQueriesMixin, WorkflowQueriesMixin, ConnectionMixin):
+class Database(
+    TaskQueriesMixin,
+    WorkflowQueriesMixin,
+    AgentProfileQueriesMixin,
+    ConnectionMixin,
+):
     """Manages the SQLite connection and provides CRUD operations.
 
     Thread-safe connection management using threading.local.

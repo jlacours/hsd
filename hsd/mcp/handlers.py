@@ -1,16 +1,11 @@
 """Tool call dispatch and task serialization for the MCP server."""
 
-import re
+import sqlite3
 
 from mcp.types import CallToolResult
 
 from hsd.core.db import Database
-from hsd.core.rules import (
-    validate_transition,
-    validate_submit_gate,
-    validate_no_self_review,
-    validate_model_note,
-)
+from hsd.core.rules import validate_no_self_review
 from hsd.core.secret_scan import validate_no_secrets
 from hsd.render.markdown import render_task as render_md
 from hsd.render.org import render_task as render_org
@@ -53,42 +48,23 @@ async def _handle_call(
             return ok_result(_task_to_dict(task))
 
         case "create_task":
-            # Validate slug is kebab-case
-            slug = args["slug"]
-            if not re.match(r'^[a-z][a-z0-9-]*$', slug):
-                return error_result(
-                    f"Invalid slug: {slug!r}. Slug must be kebab-case "
-                    f"(lowercase letters, digits, hyphens only)."
+            try:
+                task = db.create_task(
+                    slug=args["slug"],
+                    title=args["title"],
+                    destination=args.get("destination", "any"),
+                    sections=args.get("sections", {}),
+                    source_harness=args["source_harness"],
+                    source_model=args["source_model"],
+                    model_check_note=args.get("model_check_note"),
+                    author=args.get("author"),
+                    working_dir=args.get("working_dir"),
+                    repository=args.get("repository"),
+                    branch_commit=args.get("branch_commit"),
+                    tree_state=args.get("tree_state"),
                 )
-            # Validate model note
-            ok, err = validate_model_note(
-                args.get("source_model", ""),
-                args.get("model_check_note"),
-            )
-            if not ok:
-                return error_result(err)
-
-            # Validate no secrets in sections
-            sections = args.get("sections", {})
-            for key, content in sections.items():
-                ok, err = validate_no_secrets(content)
-                if not ok:
-                    return error_result(f"Secret in section '{key}': {err}")
-
-            task = db.create_task(
-                slug=slug,
-                title=args["title"],
-                destination=args.get("destination", "any"),
-                sections=sections,
-                source_harness=args["source_harness"],
-                source_model=args["source_model"],
-                model_check_note=args.get("model_check_note"),
-                author=args.get("author"),
-                working_dir=args.get("working_dir"),
-                repository=args.get("repository"),
-                branch_commit=args.get("branch_commit"),
-                tree_state=args.get("tree_state"),
-            )
+            except (ValueError, sqlite3.IntegrityError) as error:
+                return error_result(str(error))
             return ok_result(_task_to_dict(task))
 
         case "claim_task":
@@ -124,11 +100,14 @@ async def _handle_call(
                     ok, err = validate_no_secrets(content)
                     if not ok:
                         return error_result(f"Secret in section '{key}': {err}")
-            result = db.update_task(
-                args["slug_or_id"],
-                section_patches=section_patches,
-                status=args.get("status"),
-            )
+            try:
+                result = db.update_task(
+                    args["slug_or_id"],
+                    section_patches=section_patches,
+                    status=args.get("status"),
+                )
+            except ValueError as error:
+                return error_result(str(error))
             if result is None:
                 return error_result(f"Task not found: {args['slug_or_id']}")
             return ok_result(_task_to_dict(result))
@@ -146,36 +125,18 @@ async def _handle_call(
                     f"owner '{task.owner_harness}'"
                 )
 
-            # Validate transition
-            ok, reason = validate_transition(task, "done")
-            if not ok:
-                return error_result(reason)
-
-            # Patch sections first
             sections = args.get("sections", {})
-            for key, content in sections.items():
-                ok, err = validate_no_secrets(content)
-                if not ok:
-                    return error_result(f"Secret in section '{key}': {err}")
-
-            if sections:
-                task = db.update_task(task.slug, section_patches=sections)
-                if task is None:
-                    return error_result("Task not found after update")
-
-            # Check submit gate
-            ok, reason = validate_submit_gate(task)
-            if not ok:
-                return error_result(f"Submit gate: {reason}")
-
-            result = db.transition_task(
-                task.slug, "done",
-                actor_harness=harness or task.owner_harness or "unknown",
-                actor_model=args.get("model") or task.owner_model or "unknown",
-                note="submitted for review",
-                diff=args.get("diff"),
-                verify_cmd=args.get("verify_cmd"),
-            )
+            try:
+                result = db.submit_task_for_review(
+                    task.slug,
+                    actor_harness=harness or task.owner_harness or "unknown",
+                    actor_model=args.get("model") or task.owner_model or "unknown",
+                    sections=sections,
+                    diff=args.get("diff"),
+                    verify_cmd=args.get("verify_cmd"),
+                )
+            except ValueError as error:
+                return error_result(str(error))
             return ok_result(_task_to_dict(result))
 
         case "record_review":

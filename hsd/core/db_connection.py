@@ -1,12 +1,20 @@
 """SQLite connection and transaction management."""
 
 import sqlite3
+import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from hsd.core.db_schema import SCHEMA_SQL, TASKS_COLUMNS, TASKS_TABLE_BODY
+from hsd.core.db_schema import (
+    SCHEMA_SQL,
+    SECTIONS_TABLE_BODY,
+    TASK_FORMAT_TRIGGERS_SQL,
+    TASKS_COLUMNS,
+    TASKS_TABLE_BODY,
+)
 from hsd.core.models import Section, Task
+from hsd.core.task_format import CANONICAL_SECTION_NAMES, CREATION_REQUIRED_SECTIONS
 
 
 class ConnectionMixin:
@@ -38,15 +46,120 @@ class ConnectionMixin:
         existing = {
             row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
         }
-        for column in ("diff", "verify_cmd"):
+        additive_columns = {
+            "diff": "TEXT",
+            "verify_cmd": "TEXT",
+            "herdr_session": "TEXT",
+            "objective_section": "TEXT NOT NULL DEFAULT 'objective'",
+            "current_state_section": "TEXT NOT NULL DEFAULT 'current_state'",
+        }
+        for column, definition in additive_columns.items():
             if column not in existing:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        rows = conn.execute(
+            "SELECT id, herdr_session FROM tasks ORDER BY id"
+        ).fetchall()
+        seen_sessions: set[str] = set()
+        for row in rows:
+            session = row["herdr_session"]
+            if not session or session in seen_sessions:
+                session = self._new_herdr_session(seen_sessions)
+                conn.execute(
+                    "UPDATE tasks SET herdr_session = ? WHERE id = ?",
+                    (session, row["id"]),
+                )
+            seen_sessions.add(session)
         conn.commit()
+        self._backfill_creation_sections(conn)
         table_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
         ).fetchone()["sql"]
-        if "'closed'" not in table_sql:
+        if (
+            "'closed'" not in table_sql
+            or "FOREIGN KEY (id, objective_section)" not in table_sql
+            or not self._herdr_constraints_are_canonical(conn)
+        ):
             self._rebuild_tasks_table(conn)
+        sections_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sections'"
+        ).fetchone()["sql"]
+        if "'plan'" not in sections_sql:
+            self._rebuild_sections_table(conn)
+        conn.executescript(TASK_FORMAT_TRIGGERS_SQL)
+        conn.commit()
+
+    @staticmethod
+    def _new_herdr_session(existing: set[str]) -> str:
+        """Return a random task-scoped Herdr session absent from ``existing``."""
+        while True:
+            candidate = f"hsd-{uuid.uuid4().hex[:16]}"
+            if candidate not in existing:
+                return candidate
+
+    @staticmethod
+    def _herdr_constraints_are_canonical(conn: sqlite3.Connection) -> bool:
+        """Check constraints that ALTER TABLE cannot add to legacy columns."""
+        columns = {
+            row["name"]: row for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        column = columns.get("herdr_session")
+        if column is None or column["notnull"] != 1:
+            return False
+        for index in conn.execute("PRAGMA index_list(tasks)").fetchall():
+            if index["unique"] != 1:
+                continue
+            indexed = conn.execute(
+                f"PRAGMA index_info({index['name']!r})"
+            ).fetchall()
+            if [row["name"] for row in indexed] == ["herdr_session"]:
+                return True
+        return False
+
+    @staticmethod
+    def _backfill_creation_sections(conn: sqlite3.Connection) -> None:
+        """Bring legacy tasks up to the minimum canonical creation shape."""
+        placeholders = {
+            "objective": "(legacy task — objective not recorded)",
+            "current_state": "(legacy task — current state not recorded)",
+        }
+        with _immediate(conn):
+            for name in CREATION_REQUIRED_SECTIONS:
+                conn.execute(
+                    """INSERT INTO sections (task_id, name, content)
+                       SELECT tasks.id, ?, ?
+                       FROM tasks
+                       LEFT JOIN sections
+                         ON sections.task_id = tasks.id AND sections.name = ?
+                       WHERE sections.task_id IS NULL""",
+                    (name, placeholders[name], name),
+                )
+                conn.execute(
+                    """UPDATE sections SET content = ?
+                       WHERE name = ? AND trim(content) = ''""",
+                    (placeholders[name], name),
+                )
+
+    def _rebuild_sections_table(self, conn: sqlite3.Connection) -> None:
+        """Expand the sections CHECK constraint for the authoring plan."""
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF;")
+        try:
+            with _immediate(conn):
+                conn.execute(f"CREATE TABLE sections_rebuild ({SECTIONS_TABLE_BODY})")
+                conn.execute(
+                    """INSERT INTO sections_rebuild (task_id, name, content)
+                       SELECT task_id, name, content FROM sections"""
+                )
+                conn.execute("DROP TABLE sections")
+                conn.execute("ALTER TABLE sections_rebuild RENAME TO sections")
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"foreign key violations after sections table rebuild: "
+                        f"{[tuple(v) for v in violations]}"
+                    )
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON;")
 
     def _rebuild_tasks_table(self, conn: sqlite3.Connection) -> None:
         """Rebuild the tasks table to pick up CHECK constraint changes.
@@ -72,12 +185,12 @@ class ConnectionMixin:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tasks_dest ON tasks(destination, stage)"
                 )
-            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise sqlite3.IntegrityError(
-                    f"foreign key violations after tasks table rebuild: "
-                    f"{[tuple(v) for v in violations]}"
-                )
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"foreign key violations after tasks table rebuild: "
+                        f"{[tuple(v) for v in violations]}"
+                    )
         finally:
             conn.execute("PRAGMA foreign_keys=ON;")
 
@@ -100,6 +213,8 @@ class ConnectionMixin:
 
     def _row_to_task(self, row: sqlite3.Row, conn: sqlite3.Connection) -> Task:
         d = dict(row)
+        d.pop("objective_section", None)
+        d.pop("current_state_section", None)
         task_id = d["id"]
         section_rows = conn.execute(
             "SELECT name, content FROM sections WHERE task_id = ?",
@@ -117,14 +232,11 @@ class ConnectionMixin:
 
     @staticmethod
     def _validate_section_name(name: str) -> None:
-        valid = {
-            "objective", "current_state", "summary_for_review", "work_completed",
-            "files_changed", "commands_verification", "decisions_assumptions",
-            "blockers_risks", "warnings", "next_actions", "artifacts",
-            "continuation_prompt", "raw",
-        }
-        if name not in valid:
-            raise ValueError(f"invalid section name: {name!r} (valid: {sorted(valid)})")
+        if name not in CANONICAL_SECTION_NAMES:
+            raise ValueError(
+                f"invalid section name: {name!r} "
+                f"(valid: {list(CANONICAL_SECTION_NAMES)})"
+            )
 
 
 def _utcnow() -> str:

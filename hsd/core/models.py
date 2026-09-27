@@ -11,6 +11,14 @@ class Section:
 
 
 @dataclass
+class AgentProfile:
+    purpose: str
+    provider: str
+    model: str
+    updated_at: str
+
+
+@dataclass
 class Transition:
     id: int
     task_id: int
@@ -46,6 +54,7 @@ class Task:
     status: str
     source_harness: str
     source_model: str
+    herdr_session: str
     created_at: str
     updated_at: str
     model_check_note: str | None = None

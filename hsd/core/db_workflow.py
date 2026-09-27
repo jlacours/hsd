@@ -2,11 +2,84 @@
 
 from hsd.core.db_connection import _immediate, _utcnow
 from hsd.core.models import Review, Task, Transition
-from hsd.core.rules import validate_transition
+from hsd.core.rules import validate_submit_gate, validate_transition
 from hsd.core.secret_scan import validate_no_secrets
+from hsd.core.task_format import validate_task_sections
 
 
 class WorkflowQueriesMixin:
+    def submit_task_for_review(
+        self,
+        slug_or_id: str | int,
+        *,
+        actor_harness: str,
+        actor_model: str,
+        sections: dict[str, str],
+        diff: str | None = None,
+        verify_cmd: str | None = None,
+        note: str = "submitted for review",
+    ) -> Task | None:
+        """Patch review sections and submit in one all-or-nothing transaction."""
+        validate_task_sections(sections)
+        if diff is not None:
+            ok, reason = validate_no_secrets(diff)
+            if not ok:
+                raise ValueError(reason)
+
+        conn = self._conn()
+        with _immediate(conn):
+            task = self.get_task(slug_or_id)
+            if task is None:
+                return None
+            if (
+                task.owner_harness
+                and actor_harness.lower() != task.owner_harness.lower()
+            ):
+                raise ValueError(
+                    f"submit_for_review denied: harness {actor_harness!r} "
+                    f"does not match owner {task.owner_harness!r}"
+                )
+            ok, reason = validate_transition(task, "done")
+            if not ok:
+                raise ValueError(reason)
+
+            for name, content in sections.items():
+                conn.execute(
+                    """INSERT INTO sections (task_id, name, content)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(task_id, name)
+                       DO UPDATE SET content = excluded.content""",
+                    (task.id, name, content),
+                )
+
+            candidate = self.get_task(task.id)
+            ok, reason = validate_submit_gate(candidate)
+            if not ok:
+                raise ValueError(f"Submit gate: {reason}")
+
+            now = _utcnow()
+            conn.execute(
+                """UPDATE tasks
+                   SET stage = 'done', status = 'complete', updated_at = ?
+                   WHERE id = ?""",
+                (now, task.id),
+            )
+            if diff is not None:
+                conn.execute("UPDATE tasks SET diff = ? WHERE id = ?", (diff, task.id))
+            if verify_cmd is not None:
+                conn.execute(
+                    "UPDATE tasks SET verify_cmd = ? WHERE id = ?",
+                    (verify_cmd, task.id),
+                )
+            conn.execute(
+                """INSERT INTO transitions
+                   (task_id, at, actor_harness, actor_model,
+                    from_stage, to_stage, note)
+                   VALUES (?, ?, ?, ?, ?, 'done', ?)""",
+                (task.id, now, actor_harness, actor_model, task.stage, note),
+            )
+        return self.get_task(task.id)
+
     def transition_task(
         self,
         slug_or_id: str | int,

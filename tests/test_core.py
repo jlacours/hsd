@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from hsd.core.db import Database
+from hsd.core.db_schema import SCHEMA_SQL
 from hsd.core.models import ALLOWED_TRANSITIONS, REQUIRED_SUBMIT_SECTIONS
 from hsd.core.rules import (
     validate_transition,
@@ -23,7 +24,7 @@ class TestCreateTask:
             slug="my-task",
             title="My Task",
             destination="opencode",
-            sections={"objective": "Do the thing"},
+            sections={"objective": "Do the thing", "current_state": "Initial state"},
             source_harness="opencode",
             source_model="deepseek-v4",
         )
@@ -33,7 +34,8 @@ class TestCreateTask:
         assert task.stage == "todo"
         assert task.status == "queued"
         assert task.destination == "opencode"
-        assert task.sections[0].name == "objective"
+        assert task.sections_dict()["objective"] == "Do the thing"
+        assert task.sections_dict()["current_state"] == "Initial state"
 
         # Retrieve by slug
         t2 = db.get_task("my-task")
@@ -50,7 +52,7 @@ class TestCreateTask:
             slug="timestamps",
             title="Check stamps",
             destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="test",
             source_model="test",
         )
@@ -61,12 +63,12 @@ class TestCreateTask:
     def test_duplicate_slug_raises(self, db: Database):
         db.create_task(
             slug="dup", title="First", destination="any",
-            sections={"objective": "a"}, source_harness="h", source_model="m",
+            sections={"objective": "a", "current_state": "Initial state"}, source_harness="h", source_model="m",
         )
         with pytest.raises(Exception):
             db.create_task(
                 slug="dup", title="Second", destination="any",
-                sections={"objective": "b"}, source_harness="h", source_model="m",
+                sections={"objective": "b", "current_state": "Initial state"}, source_harness="h", source_model="m",
             )
 
     def test_invalid_section_name_raises(self, db: Database):
@@ -76,6 +78,117 @@ class TestCreateTask:
                 sections={"nonexistent": "content"},
                 source_harness="h", source_model="m",
             )
+
+    @pytest.mark.parametrize(
+        ("slug", "sections", "message"),
+        [
+            (
+                "Bad Slug",
+                {"objective": "Do it", "current_state": "Not done"},
+                "Invalid slug",
+            ),
+            ("missing-current", {"objective": "Do it"}, "current_state"),
+            (
+                "empty-objective",
+                {"objective": "  ", "current_state": "Not done"},
+                "objective",
+            ),
+        ],
+    )
+    def test_creation_format_is_enforced(self, db, slug, sections, message):
+        with pytest.raises(ValueError, match=message):
+            db.create_task(
+                slug=slug,
+                title="Canonical task",
+                destination="any",
+                sections=sections,
+                source_harness="pytest",
+                source_model="test-model",
+            )
+
+    def test_database_schema_rejects_invalid_slug(self, db):
+        with pytest.raises(sqlite3.IntegrityError, match="canonical task metadata"):
+            db._conn().execute(
+                """INSERT INTO tasks
+                   (slug, title, destination, stage, status, source_harness,
+                    source_model, herdr_session, created_at, updated_at)
+                   VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)""",
+                (
+                    "Bad Slug",
+                    "Invalid raw task",
+                    "any",
+                    "pytest",
+                    "test-model",
+                    "hsd-invalid-raw",
+                    "2026-07-31T00:00:00Z",
+                    "2026-07-31T00:00:00Z",
+                ),
+            )
+
+    def test_database_requires_creation_sections_at_commit(self, db):
+        db._conn().execute(
+            """INSERT INTO tasks
+               (slug, title, destination, stage, status, source_harness,
+                source_model, herdr_session, created_at, updated_at)
+               VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)""",
+            (
+                "raw-without-sections",
+                "Raw task",
+                "any",
+                "pytest",
+                "test-model",
+                "hsd-raw-no-sections",
+                "2026-07-31T00:00:00Z",
+                "2026-07-31T00:00:00Z",
+            ),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+            db._conn().commit()
+        db._conn().rollback()
+
+    def test_required_sections_cannot_be_emptied(self, db):
+        task = db.create_task(
+            slug="preserve-format",
+            title="Preserve Format",
+            destination="any",
+            sections={"objective": "Do it", "current_state": "Not done"},
+            source_harness="pytest",
+            source_model="test-model",
+        )
+        with pytest.raises(ValueError, match="objective"):
+            db.update_task(task.slug, section_patches={"objective": "  "})
+
+    def test_plan_update_uses_core_secret_validation(self, db):
+        task = db.create_task(
+            slug="safe-plan",
+            title="Safe Plan",
+            destination="any",
+            sections={"objective": "Plan safely", "current_state": "No plan"},
+            source_harness="pytest",
+            source_model="test-model",
+        )
+        with pytest.raises(ValueError, match="Secret scan"):
+            db.update_plan_if_current(
+                task.slug,
+                "",
+                "AWS key: AKIAABCDEFGHIJKLMNOP",
+            )
+        assert "plan" not in db.get_task(task.slug).sections_dict()
+
+    def test_plan_is_a_first_class_section(self, db: Database):
+        task = db.create_task(
+            slug="planned-task",
+            title="Planned Task",
+            destination="any",
+            sections={
+                "objective": "Do the thing",
+                "current_state": "It is not done",
+                "plan": "# Plan\n\n1. Do the thing.",
+            },
+            source_harness="human-web",
+            source_model="human",
+        )
+        assert task.sections_dict()["plan"].startswith("# Plan")
 
     def test_model_not_exposed_validation(self):
         ok, err = validate_model_note("MODEL NOT EXPOSED", None)
@@ -111,7 +224,7 @@ class TestClaimTask:
         """Two concurrent claimers: exactly one should win."""
         db.create_task(
             slug="race-task", title="Race", destination="any",
-            sections={"objective": "race test"},
+            sections={"objective": "race test", "current_state": "Initial state"},
             source_harness="test", source_model="test",
         )
 
@@ -143,7 +256,7 @@ class TestTransitions:
     def _make_in_progress(self, db, slug="trans-test"):
         task = db.create_task(
             slug=slug, title="Transitions", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "opencode", "deepseek-v4")
@@ -172,7 +285,7 @@ class TestTransitions:
     def test_illegal_transition(self, db):
         task = db.create_task(
             slug="illegal", title="Illegal", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         ok, reason = validate_transition(task, "reviewed")
@@ -221,7 +334,7 @@ class TestTransitions:
         """transition_task raises ValueError for illegal transitions."""
         task = db.create_task(
             slug="illegal-move", title="Illegal", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         with pytest.raises(ValueError, match="not allowed|Transition"):
@@ -233,7 +346,7 @@ class TestTransitions:
         ts = "2026-07-04T10:00:00Z"
         task = db.create_task(
             slug="with-params", title="With Params", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
             stage="done", updated_at=ts,
         )
@@ -278,7 +391,7 @@ class TestNoSelfReview:
     def test_rejects_same_harness(self, db):
         task = db.create_task(
             slug="self-review", title="Self Review", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "opencode", "deepseek-v4")
@@ -290,7 +403,7 @@ class TestNoSelfReview:
     def test_allows_different_harness(self, db):
         task = db.create_task(
             slug="cross-review", title="Cross", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -302,7 +415,7 @@ class TestNoSelfReview:
     def test_allows_different_harness_and_model(self, db):
         task = db.create_task(
             slug="proper-review", title="Proper", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -343,14 +456,14 @@ class TestSecretScan:
 
 class TestListTasks:
     def test_list_all(self, db):
-        db.create_task(slug="a", title="A", destination="any", sections={"objective": "a"}, source_harness="h", source_model="m")
-        db.create_task(slug="b", title="B", destination="opencode", sections={"objective": "b"}, source_harness="h", source_model="m")
+        db.create_task(slug="a", title="A", destination="any", sections={"objective": "a", "current_state": "Initial state"}, source_harness="h", source_model="m")
+        db.create_task(slug="b", title="B", destination="opencode", sections={"objective": "b", "current_state": "Initial state"}, source_harness="h", source_model="m")
         tasks = db.list_tasks()
         assert len(tasks) >= 2
 
     def test_filter_by_harness(self, db):
-        db.create_task(slug="c1", title="C1", destination="any", sections={"objective": "c1"}, source_harness="opencode", source_model="m")
-        db.create_task(slug="c2", title="C2", destination="any", sections={"objective": "c2"}, source_harness="codex", source_model="m")
+        db.create_task(slug="c1", title="C1", destination="any", sections={"objective": "c1", "current_state": "Initial state"}, source_harness="opencode", source_model="m")
+        db.create_task(slug="c2", title="C2", destination="any", sections={"objective": "c2", "current_state": "Initial state"}, source_harness="codex", source_model="m")
         db.claim_task("c1", "opencode", "m")
         tasks = db.list_tasks(harness="opencode")
         assert all(t.owner_harness == "opencode" for t in tasks)
@@ -365,6 +478,160 @@ class TestBoardStats:
         stats = db.board_stats()
         assert stats["total"] >= 1
         assert "todo" in stats["by_stage"]
+
+
+class TestAgentProfiles:
+    def test_lists_all_workflow_purposes(self, db: Database):
+        profiles = db.list_agent_profiles()
+        assert [profile.purpose for profile in profiles] == [
+            "planning", "coding", "reviewing", "bugs", "maintenance",
+        ]
+        assert all(profile.provider == "" for profile in profiles)
+
+    def test_profile_round_trip(self, db: Database):
+        saved = db.set_agent_profile("reviewing", "openai", "gpt-5.6")
+        assert saved.provider == "openai"
+        assert saved.model == "gpt-5.6"
+
+        reopened = Database(db.db_path)
+        profile = next(
+            item for item in reopened.list_agent_profiles()
+            if item.purpose == "reviewing"
+        )
+        assert profile.provider == "openai"
+        assert profile.model == "gpt-5.6"
+
+    def test_invalid_profile_purpose_is_rejected(self, db: Database):
+        with pytest.raises(ValueError, match="invalid agent purpose"):
+            db.set_agent_profile("vibes", "openai", "gpt-whatever")
+
+    def test_existing_database_gains_plan_section(self, tmp_path):
+        db_path = tmp_path / "legacy-sections.db"
+        old_schema = SCHEMA_SQL.replace("'objective','plan'", "'objective'")
+        connection = sqlite3.connect(db_path)
+        connection.executescript(old_schema)
+        connection.close()
+
+        migrated = Database(str(db_path))
+        task = migrated.create_task(
+            slug="post-migration-plan",
+            title="Post Migration Plan",
+            destination="any",
+            sections={
+                "objective": "Verify plan migration",
+                "current_state": "The database uses a legacy section constraint",
+                "plan": "The migrated schema accepts plans.",
+            },
+            source_harness="human-web",
+            source_model="human",
+        )
+        assert task.sections_dict()["plan"] == "The migrated schema accepts plans."
+
+    def test_existing_tasks_gain_persisted_herdr_sessions(self, tmp_path):
+        db_path = tmp_path / "legacy-herdr.db"
+        old_schema = SCHEMA_SQL.replace(
+            "    herdr_session   TEXT NOT NULL UNIQUE,\n",
+            "",
+        )
+        connection = sqlite3.connect(db_path)
+        connection.executescript(old_schema)
+        connection.execute(
+            """INSERT INTO tasks
+               (slug, title, destination, stage, status, source_harness,
+                source_model, created_at, updated_at)
+               VALUES ('legacy-herdr', 'Legacy', 'any', 'todo', 'queued',
+                       'human', 'human', '2026-07-31T00:00:00Z',
+                       '2026-07-31T00:00:00Z')"""
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = Database(str(db_path))
+        session = migrated.get_task("legacy-herdr").herdr_session
+        assert session.startswith("hsd-")
+        assert Database(str(db_path)).get_task("legacy-herdr").herdr_session == session
+        assert migrated.get_task("legacy-herdr").sections_dict() == {
+            "objective": "(legacy task — objective not recorded)",
+            "current_state": "(legacy task — current state not recorded)",
+        }
+        columns = {
+            row["name"]: row
+            for row in migrated._conn().execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        assert columns["herdr_session"]["notnull"] == 1
+        unique_columns = {
+            tuple(
+                row["name"]
+                for row in migrated._conn().execute(
+                    f"PRAGMA index_info({index['name']!r})"
+                ).fetchall()
+            )
+            for index in migrated._conn().execute("PRAGMA index_list(tasks)").fetchall()
+            if index["unique"] == 1
+        }
+        assert ("herdr_session",) in unique_columns
+
+    def test_legacy_noncanonical_metadata_does_not_block_migration(self, tmp_path):
+        db_path = tmp_path / "legacy-metadata.db"
+        connection = sqlite3.connect(db_path)
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                destination TEXT NOT NULL,
+                owner_harness TEXT,
+                owner_model TEXT,
+                stage TEXT NOT NULL CHECK (stage IN
+                    ('todo','in-progress','done','reviewed',
+                     'to-be-revised-by-human','closed')),
+                status TEXT NOT NULL CHECK (status IN
+                    ('queued','in-progress','blocked','complete')),
+                source_harness TEXT NOT NULL,
+                source_model TEXT NOT NULL,
+                model_check_note TEXT,
+                author TEXT,
+                working_dir TEXT,
+                repository TEXT,
+                branch_commit TEXT,
+                tree_state TEXT,
+                diff TEXT,
+                verify_cmd TEXT,
+                herdr_session TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE sections (
+                task_id INTEGER NOT NULL REFERENCES tasks(id),
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                PRIMARY KEY (task_id, name)
+            );
+            INSERT INTO tasks
+                (id, slug, title, destination, stage, status, source_harness,
+                 source_model, herdr_session, created_at, updated_at)
+            VALUES
+                (7, 'Legacy Task', 'Legacy', 'any', 'todo', 'queued',
+                 'old-harness', 'old-model', 'hsd-legacy-metadata',
+                 '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z');
+            INSERT INTO sections (task_id, name, content)
+            VALUES (7, 'objective', 'Preserve this task'),
+                   (7, 'current_state', 'Legacy metadata');
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        migrated = Database(str(db_path))
+        assert migrated.get_task("Legacy Task").title == "Legacy"
+        trigger_names = {
+            row[0]
+            for row in migrated._conn().execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert "trg_tasks_canonical_insert" in trigger_names
 
 
 class TestRender:
@@ -390,7 +657,7 @@ class TestReviews:
     def test_add_review_accepted(self, db):
         task = db.create_task(
             slug="review-task", title="Review", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -405,7 +672,7 @@ class TestReviews:
     def test_add_review_changes_requested(self, db):
         task = db.create_task(
             slug="changes", title="Changes", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -420,7 +687,7 @@ class TestReviews:
     def test_add_review_human_revision(self, db):
         task = db.create_task(
             slug="human", title="Human", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -444,7 +711,7 @@ class TestReviews:
         """changes-requested clears owner_harness/owner_model and sets destination to original owner."""
         task = db.create_task(
             slug="cr-owner", title="CR Owner", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -463,7 +730,7 @@ class TestReviews:
         """human-revision-required clears owner_harness/owner_model, destination unchanged."""
         task = db.create_task(
             slug="hr-owner", title="HR Owner", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -482,7 +749,7 @@ class TestClosedStage:
     def _make_reviewed(self, db, slug="closed-flow"):
         task = db.create_task(
             slug=slug, title="Closed Flow", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")
@@ -535,7 +802,7 @@ class TestSubmitArtifacts:
     def _make_in_progress(self, db, slug="artifact-task"):
         task = db.create_task(
             slug=slug, title="Artifact Task", destination="any",
-            sections={"objective": "test"},
+            sections={"objective": "test", "current_state": "Initial state"},
             source_harness="h", source_model="m",
         )
         db.claim_task(task.slug, "codex", "gpt-5")

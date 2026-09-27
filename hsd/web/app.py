@@ -4,21 +4,24 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from markdown_it import MarkdownIt
 from pydantic import BaseModel
 
 from hsd.core.db import Database
+from hsd.core.db_schema import AGENT_PURPOSES
 from hsd.core.rules import validate_no_self_review
 from hsd.core.secret_scan import validate_no_secrets
 from hsd.render.markdown import render_task as render_md
 from hsd.render.org import render_task as render_org
+from hsd.web.terminal import terminal_websocket
 
 HERE = Path(__file__).parent
 STATIC_DIR = HERE / "static"
@@ -30,6 +33,31 @@ HUMAN_REVIEW_VERDICTS = {"accept": "closed", "revise": "to-be-revised-by-human"}
 class HumanReviewRequest(BaseModel):
     verdict: str
     note: str | None = None
+
+
+class CreateTaskRequest(BaseModel):
+    slug: str
+    title: str
+    destination: str = "any"
+    objective: str
+    current_state: str
+    plan: str = ""
+    working_dir: str | None = None
+    repository: str | None = None
+
+
+class PlanRequest(BaseModel):
+    plan: str
+    expected_plan: str
+
+
+class AgentProfileRequest(BaseModel):
+    provider: str = ""
+    model: str = ""
+
+
+class AgentProfilesRequest(BaseModel):
+    profiles: dict[str, AgentProfileRequest]
 
 
 @asynccontextmanager
@@ -68,6 +96,85 @@ def create_app(db: Database | None = None) -> FastAPI:
     ):
         tasks = db.list_tasks(harness=harness, stage=stage, destination=destination)
         return [_task_summary(t) for t in tasks]
+
+    @app.post("/api/tasks", status_code=201)
+    async def create_task(body: CreateTaskRequest):
+        slug = body.slug.strip()
+        title = body.title.strip()
+        planning = next(
+            p for p in db.list_agent_profiles() if p.purpose == "planning"
+        )
+        source_model = "/".join(
+            part for part in (planning.provider, planning.model) if part
+        ) or "human"
+        try:
+            task = db.create_task(
+                slug=slug,
+                title=title,
+                destination=body.destination.strip(),
+                sections={
+                    "objective": body.objective,
+                    "plan": body.plan,
+                    "current_state": body.current_state,
+                },
+                source_harness="human-web",
+                source_model=source_model,
+                author="human",
+                working_dir=body.working_dir.strip() if body.working_dir else None,
+                repository=body.repository.strip() if body.repository else None,
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(status_code=409, detail=f"Task already exists: {slug}") from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        _notify_clients(app)
+        return _task_detail(task)
+
+    @app.put("/api/tasks/{slug_or_id}/plan")
+    async def update_task_plan(slug_or_id: str, body: PlanRequest):
+        task = db.get_task(slug_or_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if not body.plan.strip():
+            raise HTTPException(status_code=400, detail="Plan is required")
+        ok, error = validate_no_secrets(body.plan)
+        if not ok:
+            raise HTTPException(status_code=400, detail=error)
+        result = db.update_plan_if_current(task.slug, body.expected_plan, body.plan)
+        if result is None:
+            raise HTTPException(
+                status_code=409,
+                detail="The plan changed since you opened it. Reload before saving.",
+            )
+        _notify_clients(app)
+        return _task_detail(result)
+
+    @app.get("/api/agent-profiles")
+    async def list_agent_profiles():
+        return [profile.__dict__ for profile in db.list_agent_profiles()]
+
+    @app.put("/api/agent-profiles")
+    async def set_agent_profiles(body: AgentProfilesRequest):
+        values: dict[str, tuple[str, str]] = {}
+        for purpose, profile in body.profiles.items():
+            _validate_agent_profile(purpose, profile)
+            values[purpose] = (profile.provider, profile.model)
+        try:
+            profiles = db.set_agent_profiles(values)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        _notify_clients(app)
+        return [profile.__dict__ for profile in profiles]
+
+    @app.put("/api/agent-profiles/{purpose}")
+    async def set_agent_profile(purpose: str, body: AgentProfileRequest):
+        _validate_agent_profile(purpose, body)
+        try:
+            profile = db.set_agent_profile(purpose, body.provider, body.model)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        _notify_clients(app)
+        return profile.__dict__
 
     @app.get("/api/tasks/{slug_or_id}")
     async def get_task(slug_or_id: str):
@@ -181,6 +288,30 @@ def create_app(db: Database | None = None) -> FastAPI:
             },
         )
 
+    @app.websocket("/ws/terminal")
+    async def terminal_socket(websocket: WebSocket):
+        purpose = websocket.query_params.get("purpose", "planning")
+        profiles = {profile.purpose: profile for profile in db.list_agent_profiles()}
+        profile = profiles.get(purpose)
+        if profile is None:
+            await websocket.close(code=1008)
+            return
+
+        task_id = websocket.query_params.get("task_id", "")
+        task = db.get_task(task_id) if task_id else None
+        if task_id and task is None:
+            await websocket.close(code=1008)
+            return
+        await terminal_websocket(
+            websocket,
+            purpose=purpose,
+            provider=profile.provider,
+            model=profile.model,
+            task_id=str(task.id) if task else "",
+            task_slug=task.slug if task else "",
+            herdr_session=_herdr_session(task) if task else "",
+        )
+
     # Static frontend
 
     # Serve index.html for the root
@@ -234,6 +365,7 @@ def _task_summary(task: "Task") -> dict:
         "staleness_hours": round(task.staleness_hours, 1),
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "herdr_session": _herdr_session(task),
     }
 
 
@@ -259,6 +391,7 @@ def _task_detail(task: "Task") -> dict:
         "verify_cmd": task.verify_cmd,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "herdr_session": _herdr_session(task),
         "sections": {s.name: s.content for s in task.sections},
         "sections_html": {s.name: MARKDOWN.render(s.content) for s in task.sections},
         "transitions": [
@@ -303,6 +436,11 @@ def _display_title(task: "Task") -> str:
     return task.title
 
 
+def _herdr_session(task: "Task") -> str:
+    """Return the stable named Herdr session assigned to a task."""
+    return task.herdr_session
+
+
 def _normalize_harness(value: str) -> str:
     value = re.sub(r"\([^)]*\)", "", value.lower())
     value = re.sub(r"\bcli\b", "", value)
@@ -317,6 +455,18 @@ def _normalize_model(value: str) -> str:
     else:
         value = value.split(" (", 1)[0].strip().strip("`")
     return value.lower()
+
+
+def _validate_agent_profile(purpose: str, profile: AgentProfileRequest) -> None:
+    if purpose not in AGENT_PURPOSES:
+        raise HTTPException(status_code=400, detail=f"Invalid workflow purpose: {purpose}")
+    if len(profile.provider) > 120 or len(profile.model) > 240:
+        raise HTTPException(status_code=400, detail="Provider or model is too long")
+    if any(ord(char) < 32 or ord(char) == 127 for char in profile.provider + profile.model):
+        raise HTTPException(
+            status_code=400,
+            detail="Provider and model cannot contain control characters",
+        )
 
 
 app = create_app()

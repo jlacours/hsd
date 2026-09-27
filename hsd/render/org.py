@@ -4,6 +4,7 @@ from hsd.core.models import Task, Section
 
 SECTION_TITLES: dict[str, str] = {
     "objective": "Objective",
+    "plan": "Plan",
     "current_state": "Current State",
     "summary_for_review": "Summary for Review",
     "work_completed": "Work Completed",
