@@ -18,6 +18,14 @@ from hsd.core.task_format import CANONICAL_SECTION_NAMES, CREATION_REQUIRED_SECT
 
 
 class ConnectionMixin:
+    def close(self) -> None:
+        """Close connections owned by this Database in the current thread."""
+        for name in ("_raw_conn", "_poll_conn"):
+            conn = getattr(self._local, name, None)
+            if conn is not None:
+                conn.close()
+                setattr(self._local, name, None)
+
     @property
     def _raw_conn(self) -> sqlite3.Connection:
         """Get the raw connection without schema init (for polling)."""

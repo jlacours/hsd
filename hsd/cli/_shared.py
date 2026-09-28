@@ -6,18 +6,27 @@ import sys
 
 import click
 
-from hsd.core.db import Database
+from hsd.core.db import Database, get_default_db_path
 from hsd.core.models import Task
 
 PASS_DB = click.make_pass_decorator(Database, ensure=True)
 
 
 @click.group()
-@click.option("--db", default=None, help="Database path (default: XDG_DATA_HOME/hsd/hsd.db)")
+@click.option(
+    "--db",
+    default=None,
+    help="Database path (default: HSD_DB_PATH, otherwise XDG_DATA_HOME/hsd/hsd.db)",
+)
 @click.pass_context
 def cli(ctx: click.Context, db: str | None) -> None:
     """HSD — Handoff Specification Database v2."""
-    ctx.obj = Database(db)
+    # The TUI owns its short-lived connections and must be able to report a
+    # locked database in the interface, so pass it a path without opening DB.
+    if ctx.invoked_subcommand == "tui":
+        ctx.obj = db if db is not None else get_default_db_path()
+    else:
+        ctx.obj = Database(db)
 
 
 def _resolve_task(db: Database, slug_or_id: str) -> Task | None:

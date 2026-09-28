@@ -19,7 +19,13 @@ from hsd.core.secret_scan import validate_no_secrets
 
 
 def get_default_db_path() -> str:
-    """Return the default database path under XDG_DATA_HOME."""
+    """Return the configured database path, defaulting under XDG_DATA_HOME."""
+    configured_path = os.environ.get("HSD_DB_PATH")
+    if configured_path:
+        path = Path(configured_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
     data_home = os.environ.get(
         "XDG_DATA_HOME",
         os.path.join(os.path.expanduser("~"), ".local", "share"),

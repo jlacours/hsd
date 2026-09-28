@@ -7,7 +7,7 @@ point and ``from hsd.cli import main`` continue to work.
 """
 
 from hsd.cli._shared import PASS_DB, _parse_sections, _resolve_task, cli
-from hsd.cli import draft, flow, ops, read  # noqa: F401  (registers commands)
+from hsd.cli import draft, flow, ops, read, tui  # noqa: F401  (registers commands)
 
 
 def main() -> None:

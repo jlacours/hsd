@@ -1,5 +1,8 @@
 """Tests for CLI database selection and command wiring."""
 
+import subprocess
+import sys
+
 from click.testing import CliRunner
 
 from hsd.cli import cli
@@ -67,3 +70,34 @@ def test_update_validation_is_a_friendly_cli_error(tmp_path):
     )
     assert result.exit_code == 1
     assert "Error: section 'objective' must not be empty" in result.output
+
+
+def test_tui_help_does_not_import_textual_app():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from click.testing import CliRunner; from hsd.cli import cli; import sys; "
+            "r = CliRunner().invoke(cli, ['tui', '--help']); "
+            "assert r.exit_code == 0, r.output; "
+            "assert 'interactive task board' in r.output; "
+            "assert 'hsd.tui.app' not in sys.modules; "
+            "r = CliRunner().invoke(cli, ['ls', '--help']); "
+            "assert r.exit_code == 0, r.output; "
+            "assert 'hsd.tui.app' not in sys.modules",
+        ],
+        cwd=".",
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_hsd_db_path_environment_variable(monkeypatch, tmp_path):
+    requested_path = tmp_path / "custom" / "board.db"
+    monkeypatch.setenv("HSD_DB_PATH", str(requested_path))
+
+    from hsd.core.db import get_default_db_path
+
+    assert get_default_db_path() == str(requested_path)
+    assert requested_path.parent.is_dir()
